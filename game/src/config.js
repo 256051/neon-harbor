@@ -36,7 +36,6 @@ export const CAR = {
 // Feel table: every handling number in one place. Tune the feel here and
 // nowhere else — acceleration, braking, steering, drift, camera.
 export const FEEL = {
-  walkAccel: 40, // not used directly; walk speed ramps at 8/s in world.js
   carSteer: 2.6, // == CAR.grip, kept here as the single steering knob
   carDrift: 0.35, // how much speed survives a hard turn (lower = more slide)
   camAlign: 1.2, // rad/s the camera swings back behind the player

@@ -1,328 +1,323 @@
-// Neon Harbor — the DOM HUD: cash, stars, health, speed, mission, clock,
-// prompts, banners, plus the 2D canvas minimap, a compass strip, the radio
-// typewriter, hit markers and the kill feed. The 3D scene is in render.js.
-// The compass and the minimap share one projection: world -> screen bearing
-// (compass) and world -> map pixel (minimap), both derived from the same
-// player position and camera yaw.
-import { CITY_HALF, MISSIONS, PITCH } from './config.js';
+// Neon Harbor — the HUD, drawn on a Canvas 2D layer over the WebGL canvas:
+// a minimap (top-right, same projection as the compass strip below it), a
+// compass strip (top-centre), health, cash, wanted stars, the mission line,
+// toast messages, and the title / pause / dead / win screens. It reads the
+// world every frame and never writes to it.
+import { CITY_HALF, PITCH, STREETS } from './config.js';
+import { streetCoord, missionDef, missionText } from './world.js';
 
-const COMPASS_NAMES = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-// Compass degrees from a world heading (atan2(x, z) radians): 0 = north.
-function compassDeg(heading) {
-  return (((180 - (heading * 180) / Math.PI) % 360) + 360) % 360;
-}
-function bearingDiff(a, b) {
-  let d = a - b;
-  while (d > 180) d -= 360;
-  while (d < -180) d += 360;
-  return d;
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
 }
 
-export function createHud(world) {
-  const el = (id) => document.getElementById(id);
-  const hud = el('hud');
-  const cashEl = el('cash');
-  const clockEl = el('clock');
-  const starsEl = el('stars');
-  const healthFill = el('health-fill');
-  const carHealthRow = el('car-health-row');
-  const carHealthFill = el('car-health-fill');
-  const speedEl = el('speed');
-  const missionTitle = el('mission-title');
-  const missionText = el('mission-text');
-  const missionTimer = el('mission-timer');
-  const promptEl = el('prompt');
-  const messageEl = el('message');
-  const bannerEl = el('banner');
-  const muteEl = el('mute-indicator');
-  const map = el('minimap');
-  const mapCtx = map.getContext('2d');
-  const compass = el('compass');
-  const compassCtx = compass.getContext('2d');
-  const radioEl = el('radio');
-  const hitEl = el('hitmarker');
-  const feedEl = el('feed');
+export function createHud(canvas, world) {
+  const ctx = canvas.getContext('2d');
+  let toastText = '';
+  let toastTime = 0;
+  let fps = 0;
+  let fpsFrames = 0;
+  let fpsTime = 0;
 
-  let lastStars = -1;
-  let lastCash = -1;
-  let lastHealth = -1;
-  let lastMission = '';
-  let lastMessage = '';
-  let lastBanner = '';
-
-  // Radio typewriter: a queue of lines, typed at 58 chars/s, each held
-  // briefly when complete. Cheap storytelling: the mission briefings,
-  // police dispatch and tips all come through here.
-  const radioQueue = [];
-  let radioCurrent = '';
-  let radioShown = 0;
-  let radioHold = 0;
-  const RADIO_CPS = 58;
-  function radio(text) {
-    if (text) radioQueue.push(text);
+  function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
   }
-  function updateRadio(dt) {
-    if (!radioCurrent && radioQueue.length > 0) {
-      radioCurrent = radioQueue.shift();
-      radioShown = 0;
-      radioHold = 0;
-    }
-    if (radioCurrent) {
-      if (radioShown < radioCurrent.length) {
-        radioShown = Math.min(radioCurrent.length, radioShown + RADIO_CPS * dt);
-        radioEl.textContent = `📻 ${radioCurrent.slice(0, Math.floor(radioShown))}`;
-        radioEl.style.display = 'block';
-      } else {
-        radioHold += dt;
-        if (radioHold > 2.2) {
-          radioCurrent = '';
-          radioEl.style.display = 'none';
-        }
-      }
-    }
+  resize();
+  window.addEventListener('resize', resize);
+
+  function showToast(text, seconds = 4) {
+    toastText = text;
+    toastTime = seconds;
   }
 
-  // Hit markers: hit (white), weak (grey, half damage at range), kill (red,
-  // 1.5x). One element, re-triggered by swapping the class.
-  let hitTimer = 0;
-  function hitmark(type) {
-    hitEl.className = '';
-    void hitEl.offsetWidth; // restart the CSS animation
-    hitEl.className = type === 'kill' ? 'kill' : type === 'weak' ? 'weak' : 'hit';
-    hitTimer = 0.35;
-  }
+  // --- Minimap -------------------------------------------------------------------
+  // The compass strip and the minimap share one projection: world north
+  // (-Z) is up on the map, and the strip's tick for a heading is placed by
+  // the same angle math the 3D camera uses.
+  function drawMinimap() {
+    const size = 190;
+    const x0 = canvas.width - size - 16;
+    const y0 = 16;
+    const range = CITY_HALF + PITCH / 2;
+    const scale = size / (range * 2);
+    const toMap = (wx, wz) => [x0 + (wx + range) * scale, y0 + (wz + range) * scale];
 
-  // Kill feed: at most 4 lines, each alive 4.2 s. Wanted upgrades use the
-  // same feed so the player always sees why the heat rose.
-  function feed(text) {
-    const div = document.createElement('div');
-    div.className = 'feed-line';
-    div.textContent = text;
-    feedEl.prepend(div);
-    while (feedEl.children.length > 4) feedEl.removeChild(feedEl.lastChild);
-    setTimeout(() => { if (div.parentNode) div.parentNode.removeChild(div); }, 4200);
-  }
-
-  function fmtClock(min) {
-    const h = Math.floor(min / 60) % 24;
-    const m = Math.floor(min % 60);
-    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-  }
-
-  function drawCompass(state) {
-    const W = compass.width;
-    const H = compass.height;
-    const ctx = compassCtx;
-    ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = 'rgba(10, 12, 24, 0.72)';
-    ctx.fillRect(0, 0, W, H);
-    const centerDeg = compassDeg(state.camYaw + Math.PI);
-    const pxPerDeg = W / 120; // +-60 degrees visible
-    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
-    ctx.fillStyle = '#eef1f5';
-    ctx.font = '11px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    for (let d = Math.floor(centerDeg - 60); d <= centerDeg + 60; d += 5) {
-      const deg = ((d % 360) + 360) % 360;
-      const x = W / 2 + bearingDiff(deg, centerDeg) * pxPerDeg;
-      const isMajor = deg % 45 === 0;
-      const isMid = deg % 15 === 0;
-      ctx.beginPath();
-      ctx.moveTo(x, isMajor ? 4 : isMid ? 8 : 12);
-      ctx.lineTo(x, 18);
-      ctx.stroke();
-      if (isMajor) {
-        ctx.fillText(COMPASS_NAMES[Math.round(deg / 45) % 8], x, 24);
-      }
-    }
-    // Mission marker on the compass, at its bearing from the player.
-    const marker = world.markerPos();
-    if (marker) {
-      const p = state.player;
-      const b = compassDeg(Math.atan2(marker.x - p.x, marker.z - p.z));
-      const diff = bearingDiff(b, centerDeg);
-      if (Math.abs(diff) < 58) {
-        const x = W / 2 + diff * pxPerDeg;
-        ctx.fillStyle = '#ffd23f';
-        ctx.beginPath();
-        ctx.moveTo(x, 2);
-        ctx.lineTo(x + 5, 8);
-        ctx.lineTo(x, 14);
-        ctx.lineTo(x - 5, 8);
-        ctx.closePath();
-        ctx.fill();
-      }
-    }
-    // Centre caret.
-    ctx.fillStyle = '#ffd23f';
-    ctx.beginPath();
-    ctx.moveTo(W / 2, H - 2);
-    ctx.lineTo(W / 2 - 5, H - 8);
-    ctx.lineTo(W / 2 + 5, H - 8);
-    ctx.closePath();
+    ctx.save();
+    ctx.fillStyle = 'rgba(10, 12, 24, 0.78)';
+    roundRect(ctx, x0 - 6, y0 - 6, size + 12, size + 12, 10);
     ctx.fill();
-  }
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.beginPath();
+    roundRect(ctx, x0, y0, size, size, 6);
+    ctx.clip();
 
-  function drawMinimap(state, now) {
-    const S = map.width;
-    const scale = S / (CITY_HALF * 2 + 30);
-    const toMap = (v) => (v + CITY_HALF + 15) * scale;
-    mapCtx.fillStyle = 'rgba(12, 14, 26, 0.85)';
-    mapCtx.fillRect(0, 0, S, S);
-    // Streets.
-    mapCtx.strokeStyle = '#565670';
-    mapCtx.lineWidth = 3;
-    for (let k = -4; k <= 4; k += 1) {
-      mapCtx.beginPath();
-      mapCtx.moveTo(toMap(k * PITCH), 0);
-      mapCtx.lineTo(toMap(k * PITCH), S);
-      mapCtx.stroke();
-      mapCtx.beginPath();
-      mapCtx.moveTo(0, toMap(k * PITCH));
-      mapCtx.lineTo(S, toMap(k * PITCH));
-      mapCtx.stroke();
+    // Roads.
+    ctx.strokeStyle = 'rgba(160,170,200,0.55)';
+    ctx.lineWidth = Math.max(2, 12 * scale);
+    for (let i = 0; i < STREETS; i += 1) {
+      const c = streetCoord(i);
+      const [ax, ay] = toMap(-range, c);
+      const [bx, by] = toMap(range, c);
+      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+      const [cx, cy] = toMap(c, -range);
+      const [dx, dy] = toMap(c, range);
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(dx, dy); ctx.stroke();
+    }
+    // Buildings.
+    ctx.fillStyle = 'rgba(120,130,170,0.8)';
+    for (const b of world.buildings) {
+      const [bx, by] = toMap(b.x - b.w / 2, b.z - b.d / 2);
+      ctx.fillRect(bx, by, Math.max(1.5, b.w * scale), Math.max(1.5, b.d * scale));
     }
     // Cash pickups.
-    mapCtx.fillStyle = '#2ecc71';
-    for (const pk of state.pickups) {
-      if (!pk.active) continue;
-      mapCtx.fillRect(toMap(pk.x) - 2, toMap(pk.z) - 2, 4, 4);
+    ctx.fillStyle = '#ffd23f';
+    for (const pickup of world.pickups) {
+      if (pickup.taken) continue;
+      const [px, py] = toMap(pickup.x, pickup.z);
+      ctx.fillRect(px - 2, py - 2, 4, 4);
     }
-    // Traffic (white dots).
-    mapCtx.fillStyle = '#dddddd';
-    for (const car of state.cars) {
-      if (!car.active || car.kind !== 'traffic') continue;
-      mapCtx.fillRect(toMap(car.x) - 1.5, toMap(car.z) - 1.5, 3, 3);
+    // Police.
+    ctx.fillStyle = '#4da6ff';
+    for (const car of world.police) {
+      if (car.wrecked) continue;
+      const [px, py] = toMap(car.x, car.z);
+      ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill();
     }
-    // Police (flashing blue/red).
-    const flash = Math.floor(now * 2) % 2 === 0;
-    mapCtx.fillStyle = flash ? '#4488ff' : '#ff4444';
-    for (const car of state.cars) {
-      if (!car.active || car.kind !== 'police') continue;
-      mapCtx.beginPath();
-      mapCtx.arc(toMap(car.x), toMap(car.z), 4, 0, Math.PI * 2);
-      mapCtx.fill();
-    }
-    // Mission marker.
-    const marker = world.markerPos();
-    if (marker) {
-      const mx = toMap(marker.x);
-      const my = toMap(marker.z);
-      const pulse = 5 + Math.sin(now * 4) * 1.5;
-      mapCtx.fillStyle = '#ffd23f';
-      mapCtx.beginPath();
-      mapCtx.moveTo(mx, my - pulse);
-      mapCtx.lineTo(mx + pulse, my);
-      mapCtx.lineTo(mx, my + pulse);
-      mapCtx.lineTo(mx - pulse, my);
-      mapCtx.closePath();
-      mapCtx.fill();
+    // Mission target.
+    const def = missionDef(world);
+    if (def && world.state === 'playing') {
+      const stage = def.stages[world.missionStage];
+      if (stage && stage.target) {
+        const [tx, ty] = toMap(stage.target[0], stage.target[1]);
+        ctx.fillStyle = '#ffd23f';
+        ctx.save();
+        ctx.translate(tx, ty);
+        ctx.rotate(Math.PI / 4);
+        const pulse = 4 + Math.sin(world.time * 4) * 1.5;
+        ctx.fillRect(-pulse / 2, -pulse / 2, pulse, pulse);
+        ctx.restore();
+      }
     }
     // Player arrow.
-    const p = state.player;
-    const px = toMap(p.x);
-    const py = toMap(p.z);
-    mapCtx.save();
-    mapCtx.translate(px, py);
-    mapCtx.rotate(p.heading);
-    mapCtx.fillStyle = '#2ec4b6';
-    mapCtx.beginPath();
-    mapCtx.moveTo(0, -7);
-    mapCtx.lineTo(5, 6);
-    mapCtx.lineTo(-5, 6);
-    mapCtx.closePath();
-    mapCtx.fill();
-    mapCtx.restore();
-    // Border.
-    mapCtx.strokeStyle = 'rgba(255,255,255,0.35)';
-    mapCtx.lineWidth = 1;
-    mapCtx.strokeRect(0.5, 0.5, S - 1, S - 1);
+    const p = world.player;
+    const [px, py] = toMap(p.x, p.z);
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(Math.atan2(Math.sin(p.heading), -Math.cos(p.heading)));
+    ctx.fillStyle = '#2ec4b6';
+    ctx.beginPath();
+    ctx.moveTo(0, -7); ctx.lineTo(5, 5); ctx.lineTo(0, 2.5); ctx.lineTo(-5, 5);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+    ctx.restore();
+
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('NEON HARBOR', x0, y0 + size + 18);
   }
 
-  function update(state, screen, now, dt) {
-    hud.style.display = screen === 'play' ? 'block' : 'none';
-    if (hitTimer > 0) {
-      hitTimer -= dt || 0;
-      if (hitTimer <= 0) hitEl.className = '';
+  // --- Compass strip ---------------------------------------------------------------
+  function drawCompass(camYaw) {
+    const w = 420;
+    const h = 26;
+    const x0 = (canvas.width - w) / 2;
+    const y0 = 16;
+    ctx.save();
+    ctx.fillStyle = 'rgba(10, 12, 24, 0.7)';
+    roundRect(ctx, x0, y0, w, h, 8);
+    ctx.fill();
+    ctx.beginPath();
+    roundRect(ctx, x0, y0, w, h, 8);
+    ctx.clip();
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    // Headings: N is -Z (heading PI), E is +X (heading PI/2).
+    const marks = [
+      { label: 'N', heading: Math.PI },
+      { label: 'E', heading: Math.PI / 2 },
+      { label: 'S', heading: 0 },
+      { label: 'W', heading: -Math.PI / 2 },
+    ];
+    for (const mark of marks) {
+      let diff = mark.heading - camYaw;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      const x = x0 + w / 2 + (diff / (Math.PI / 2)) * (w / 2);
+      if (x < x0 - 20 || x > x0 + w + 20) continue;
+      ctx.fillStyle = '#ffd23f';
+      ctx.fillText(mark.label, x, y0 + h / 2);
     }
-    updateRadio(dt || 0);
-    if (screen !== 'play') return;
-    const p = state.player;
+    // Centre caret.
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(x0 + w / 2 - 6, y0 + 2);
+    ctx.lineTo(x0 + w / 2 + 6, y0 + 2);
+    ctx.lineTo(x0 + w / 2, y0 + 9);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
 
-    if (state.cash !== lastCash) {
-      lastCash = state.cash;
-      cashEl.textContent = `$${state.cash}`;
+  function drawBar(x, y, w, h, frac, fill, label) {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(ctx, x, y, w, h, h / 2);
+    ctx.fill();
+    ctx.fillStyle = fill;
+    roundRect(ctx, x + 2, y + 2, Math.max(0, (w - 4) * Math.max(0, Math.min(1, frac))), h - 4, (h - 4) / 2);
+    ctx.fill();
+    if (label) {
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, x + 8, y + h / 2 + 0.5);
     }
-    clockEl.textContent = fmtClock(state.clockMin);
-    if (state.wanted !== lastStars) {
-      lastStars = state.wanted;
-      let stars = '';
-      for (let i = 0; i < 5; i += 1) stars += i < state.wanted ? '★' : '☆';
-      starsEl.textContent = stars;
-      starsEl.classList.toggle('hot', state.wanted > 0);
-    }
-    const hp = Math.round(p.health);
-    if (hp !== lastHealth) {
-      lastHealth = hp;
-      healthFill.style.width = `${hp}%`;
-      healthFill.style.background = hp > 50 ? '#2ecc71' : hp > 25 ? '#f39c12' : '#e74c3c';
-    }
-    const car = !p.onFoot ? state.cars.find((c) => c.id === p.carId) : null;
-    if (car) {
-      carHealthRow.style.display = 'flex';
-      carHealthFill.style.width = `${Math.max(0, Math.round(car.health))}%`;
-    } else {
-      carHealthRow.style.display = 'none';
-    }
-    const kmh = Math.round(Math.abs(p.onFoot ? p.speed : (car ? car.speed : 0)) * 3.6);
-    speedEl.textContent = p.onFoot ? '' : `${kmh} km/h`;
+  }
 
-    const m = MISSIONS[state.missionIndex];
-    const stageText = m ? m.stages[state.missionStage]?.text ?? '' : 'Free roam — Neon Harbor is yours.';
-    const missionKey = `${state.missionIndex}:${state.missionStage}:${m ? m.title : ''}`;
-    if (missionKey !== lastMission) {
-      lastMission = missionKey;
-      missionTitle.textContent = m ? `${m.id}. ${m.title}` : 'Free Roam';
-      missionText.textContent = stageText;
+  function drawStars() {
+    const p = world.player;
+    const x0 = 16;
+    const y0 = 86;
+    for (let i = 0; i < 5; i += 1) {
+      ctx.font = '22px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = i < world.wanted ? '#ff4444' : 'rgba(255,255,255,0.25)';
+      ctx.fillText('★', x0 + i * 26, y0 + 18);
     }
-    const s = world.missionStageDef();
-    if (s && s.timer !== undefined && state.missionStage > 0) {
-      missionTimer.textContent = `⏱ ${Math.max(0, Math.ceil(s.timer - state.missionTimer))}s`;
-      missionTimer.style.display = 'block';
-    } else {
-      missionTimer.style.display = 'none';
+    if (world.wanted > 0) {
+      ctx.fillStyle = '#ff6666';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.fillText(`WANTED — ${world.wanted} star${world.wanted > 1 ? 's' : ''}`, x0, y0 + 40);
+    }
+    void p;
+  }
+
+  function drawTextBlock(text, x, y, size, color, align = 'left', weight = 'bold') {
+    ctx.fillStyle = color;
+    ctx.font = `${weight} ${size}px sans-serif`;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(text, x, y);
+  }
+
+  function draw(state, dt, camYaw) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (dt > 0) {
+      fpsFrames += 1;
+      fpsTime += dt;
+      if (fpsTime >= 0.5) {
+        fps = Math.round(fpsFrames / fpsTime);
+        fpsFrames = 0;
+        fpsTime = 0;
+      }
+    }
+    if (toastTime > 0) toastTime -= dt;
+
+    const p = world.player;
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+
+    if (state === 'title') {
+      ctx.fillStyle = 'rgba(8, 8, 20, 0.55)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      drawTextBlock('NEON HARBOR', cx, cy - 90, 64, '#ffd23f', 'center');
+      drawTextBlock('An open-world crime story in a dusk harbor city', cx, cy - 48, 18, '#e8e8f0', 'center', 'normal');
+      drawTextBlock('WASD drive / walk   ·   E steal car   ·   F punch   ·   Click shoot', cx, cy - 8, 16, '#c8c8d8', 'center', 'normal');
+      drawTextBlock('Mouse drag orbits   ·   Wheel zooms   ·   P pause   ·   M mute', cx, cy + 18, 16, '#c8c8d8', 'center', 'normal');
+      const pulse = 0.7 + Math.sin(world.time * 3) * 0.3;
+      ctx.globalAlpha = pulse;
+      drawTextBlock('Press SPACE or ENTER to start', cx, cy + 70, 22, '#ffffff', 'center');
+      ctx.globalAlpha = 1;
+      if (world.hasSave) {
+        drawTextBlock('Press C to continue your saved game', cx, cy + 100, 16, '#ffd23f', 'center', 'normal');
+      }
+      drawTextBlock('Original work — no real city, no real cars, no Rockstar', cx, canvas.height - 24, 12, 'rgba(255,255,255,0.5)', 'center', 'normal');
+      return;
     }
 
-    // Context prompt.
-    let prompt = '';
+    // In-play HUD.
+    drawCompass(camYaw);
+    drawMinimap();
+    drawBar(16, 16, 220, 20, p.health / 100, p.health > 30 ? '#2ecc71' : '#e74c3c', `HP ${Math.ceil(p.health)}`);
+    drawTextBlock(`$${p.cash}`, 16, 62, 26, '#ffd23f');
+    drawTextBlock(`Best $${world.best}`, 16, 84, 12, 'rgba(255,255,255,0.6)', 'left', 'normal');
+    drawStars();
+
+    // Mission line.
+    const def = missionDef(world);
+    if (def) {
+      drawTextBlock(`${def.title} — ${missionText(world)}`, 16, canvas.height - 56, 15, '#ffffff');
+      if (world.missionIndex === 1 && world.missionStage === 1 && world.missionTimer > 0) {
+        const urgent = world.missionTimer < 20;
+        drawTextBlock(`${Math.ceil(world.missionTimer)}s`, 16, canvas.height - 30, 22, urgent ? '#ff5555' : '#ffd23f');
+      }
+    }
+    // Interaction hint.
     if (p.onFoot) {
-      const near = world.nearestStealable(4.5);
-      if (near) prompt = 'Press E to steal this car';
-      else if (state.cars.some((c) => c.active && (c.kind === 'traffic' || c.kind === 'parked') && Math.hypot(c.x - p.x, c.z - p.z) < 12)) prompt = 'Get closer to a car — press E to steal';
-    } else if (car && Math.abs(car.speed) < 2) {
-      prompt = 'Press E to get out';
+      const near = world.cars.some((c) => !c.wrecked && Math.hypot(c.x - p.x, c.z - p.z) < 3.5);
+      if (near) drawTextBlock('[E] Steal car', cx, canvas.height - 100, 16, '#ffffff', 'center');
+    } else {
+      drawTextBlock('[E] Get out', cx, canvas.height - 100, 15, 'rgba(255,255,255,0.8)', 'center', 'normal');
     }
-    if (promptEl.textContent !== prompt) promptEl.textContent = prompt;
+    // Crosshair while aiming on foot.
+    if (p.onFoot) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(cx - 16, cy); ctx.lineTo(cx - 6, cy);
+      ctx.moveTo(cx + 6, cy); ctx.lineTo(cx + 16, cy);
+      ctx.moveTo(cx, cy - 16); ctx.lineTo(cx, cy - 6);
+      ctx.moveTo(cx, cy + 6); ctx.lineTo(cx, cy + 16);
+      ctx.stroke();
+    }
+    // Toast.
+    if (toastTime > 0 && toastText) {
+      ctx.fillStyle = 'rgba(10, 12, 24, 0.8)';
+      const tw = ctx.measureText(toastText).width + 32;
+      roundRect(ctx, cx - tw / 2, 64, tw, 36, 8);
+      ctx.fill();
+      drawTextBlock(toastText, cx, 88, 15, '#ffffff', 'center', 'normal');
+    }
+    // FPS + quality, small, bottom-right.
+    drawTextBlock(`${fps} fps`, canvas.width - 16, canvas.height - 16, 12, 'rgba(255,255,255,0.55)', 'right', 'normal');
 
-    if (state.message !== lastMessage || (state.messageTimer <= 0 && lastMessage !== '')) {
-      lastMessage = state.messageTimer > 0 ? state.message : '';
-      messageEl.textContent = lastMessage;
+    if (state === 'paused') {
+      ctx.fillStyle = 'rgba(8, 8, 20, 0.6)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      drawTextBlock('PAUSED', cx, cy - 20, 44, '#ffffff', 'center');
+      drawTextBlock('Press P to resume — progress autosaves every 10 s', cx, cy + 20, 16, '#c8c8d8', 'center', 'normal');
+    } else if (state === 'dead') {
+      ctx.fillStyle = 'rgba(20, 4, 8, 0.72)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      drawTextBlock('FLATLINED', cx, cy - 30, 56, '#ff4444', 'center');
+      drawTextBlock('Mara Voss is down. The harbor keeps its secrets.', cx, cy + 10, 17, '#e8e8f0', 'center', 'normal');
+      drawTextBlock(`You lost $200 — cash now $${p.cash}`, cx, cy + 40, 15, '#c8c8d8', 'center', 'normal');
+      drawTextBlock('Press SPACE to start over', cx, cy + 84, 18, '#ffffff', 'center');
+    } else if (state === 'win') {
+      ctx.fillStyle = 'rgba(8, 20, 12, 0.66)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      drawTextBlock('THE HARBOR IS YOURS', cx, cy - 30, 46, '#ffd23f', 'center');
+      drawTextBlock('All three missions complete. Mara Voss owns the night.', cx, cy + 10, 17, '#e8e8f0', 'center', 'normal');
+      drawTextBlock(`Final cash $${p.cash}   ·   Best $${world.best}`, cx, cy + 40, 15, '#c8c8d8', 'center', 'normal');
+      drawTextBlock('Press SPACE to play again', cx, cy + 84, 18, '#ffffff', 'center');
     }
-    const banner = state.missionBannerTimer > 0 ? state.missionBanner : '';
-    if (banner !== lastBanner) {
-      lastBanner = banner;
-      bannerEl.textContent = banner;
-      bannerEl.style.display = banner ? 'block' : 'none';
-    }
-
-    drawMinimap(state, now);
-    drawCompass(state);
   }
 
-  function setMuted(muted) {
-    muteEl.style.display = muted ? 'block' : 'none';
-  }
-
-  return { update, setMuted, radio, hitmark, feed };
+  return {
+    draw, showToast, resize,
+    get fps() { return fps; },
+  };
 }

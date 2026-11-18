@@ -1,604 +1,566 @@
-// Neon Harbor — drawing only, with three.js: the world's state in, pixels out.
-// Builds the city once, then keeps a pool of meshes for cars, pedestrians and
-// the player in sync with the world. The camera is a third-person follow cam;
-// the HUD itself lives in hud.js.
+// Neon Harbor — the renderer. Three.js r160, one WebGLRenderer, one scene.
+// Static geometry (buildings, roads, streetlights) is merged by material so
+// the whole city draws in a handful of calls; cars, people and pickups are
+// small groups rebuilt or moved per frame. The camera is a third-person
+// follow camera owned here; the HUD (minimap, compass, text) is a separate
+// Canvas 2D layer in hud.js.
 //
-// Performance: static geometry is merged by material at boot (all buildings
-// are 4 draw calls, all streetlight poles/heads/pools 3 more), car wheels and
-// traffic-light lamps are InstancedMeshes, and each pedestrian is 3 meshes.
-// Materials come from the cached factory in materials.js.
+// Quality tiers: high keeps shadows and a full pixel ratio, medium drops
+// shadows, low halves the pixel ratio as well. Auto-quality watches the frame
+// time and steps down when the machine cannot keep up.
 import * as THREE from 'three';
-import { mergeGeometries } from '../lib/BufferGeometryUtils.js';
-import { CITY_HALF, FEEL, PALETTE, PITCH, TRAFFIC_LIGHTS } from './config.js';
-import { basic, facade, lambert } from './materials.js';
+import { PITCH, STREETS, CITY_HALF, STREET_HALF, PALETTE, FEEL } from './config.js';
+import { streetCoord } from './world.js';
+import { mergeGeometries, BOX_FACE_MAP } from './merge.js';
+import { lambert, basic, facade } from './materials.js';
 
-const CITY_SIZE = (CITY_HALF + 24) * 2;
-
-// Quality tiers. Antialias is fixed when the renderer is created (the
-// initial tier decides it); everything else applies live.
-export const QUALITY = {
-  low: { pixelRatio: 1, shadows: false, shadowMap: 512, fogNear: 60, fogFar: 260, label: 'Low' },
-  medium: { pixelRatio: 1, shadows: true, shadowMap: 1024, fogNear: 90, fogFar: 420, label: 'Medium' },
-  high: { pixelRatio: 1.5, shadows: true, shadowMap: 1024, fogNear: 90, fogFar: 420, label: 'High' },
-  ultra: { pixelRatio: 2, shadows: true, shadowMap: 2048, fogNear: 110, fogFar: 500, label: 'Ultra' },
-};
-export const QUALITY_ORDER = ['low', 'medium', 'high', 'ultra'];
-
-function facadeTexture(base, litRatio, seed) {
-  const c = document.createElement('canvas');
-  c.width = 128; c.height = 256;
-  const g = c.getContext('2d');
-  g.fillStyle = base;
-  g.fillRect(0, 0, 128, 256);
-  // Deterministic pseudo-random windows from the seed.
-  let s = seed * 2654435761 >>> 0;
-  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
-  for (let y = 10; y < 246; y += 18) {
-    for (let x = 10; x < 118; x += 18) {
-      const lit = rnd() < litRatio;
-      g.fillStyle = lit ? (rnd() < 0.7 ? '#ffd27a' : '#9fd8ff') : '#141824';
-      g.fillRect(x, y, 11, 13);
+function makeFacadeTexture(baseColor, litRatio, seed) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = baseColor;
+  ctx.fillRect(0, 0, 128, 256);
+  // Windows: a grid, some lit warm, most dark.
+  let s = seed;
+  const rand = () => {
+    s = (s * 16807) % 2147483647;
+    return s / 2147483647;
+  };
+  for (let row = 0; row < 12; row += 1) {
+    for (let col = 0; col < 6; col += 1) {
+      const lit = rand() < litRatio;
+      ctx.fillStyle = lit ? '#ffd27a' : '#1a2030';
+      ctx.fillRect(8 + col * 20, 10 + row * 20, 12, 12);
     }
   }
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
-  return t;
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
 }
 
-function groundTexture() {
-  const S = 1024;
-  const c = document.createElement('canvas');
-  c.width = S; c.height = S;
-  const g = c.getContext('2d');
-  const scale = S / CITY_SIZE;
-  const toPx = (v) => (v + CITY_SIZE / 2) * scale;
-  g.fillStyle = '#30303e';
-  g.fillRect(0, 0, S, S);
-  // Blocks: slightly lighter pavement.
-  for (let i = -4; i < 4; i += 1) {
-    for (let j = -4; j < 4; j += 1) {
-      g.fillStyle = '#3d3d4e';
-      g.fillRect(toPx(i * PITCH + 6), toPx(j * PITCH + 6), (PITCH - 12) * scale, (PITCH - 12) * scale);
-    }
+function makeGroundTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#23232e';
+  ctx.fillRect(0, 0, 256, 256);
+  // Subtle noise so the ground is not a flat void.
+  for (let i = 0; i < 800; i += 1) {
+    const v = Math.floor(Math.random() * 20);
+    ctx.fillStyle = `rgba(255,255,255,${v / 255})`;
+    ctx.fillRect(Math.random() * 256, Math.random() * 256, 2, 2);
   }
-  // Roads.
-  g.fillStyle = '#2a2a35';
-  for (let k = -4; k <= 4; k += 1) {
-    g.fillRect(0, toPx(k * PITCH - 6), S, 12 * scale);
-    g.fillRect(toPx(k * PITCH - 6), 0, 12 * scale, S);
-  }
-  // Centre dashes.
-  g.fillStyle = '#c9a227';
-  for (let k = -4; k <= 4; k += 1) {
-    for (let v = -CITY_HALF; v < CITY_HALF; v += 12) {
-      g.fillRect(toPx(v), toPx(k * PITCH - 0.5), 5 * scale, 1 * scale);
-      g.fillRect(toPx(k * PITCH - 0.5), toPx(v), 1 * scale, 5 * scale);
-    }
-  }
-  // Sidewalk edges.
-  g.strokeStyle = '#3f3f52';
-  g.lineWidth = 2;
-  for (let k = -4; k <= 4; k += 1) {
-    g.strokeRect(toPx(k * PITCH - 6), 0, 12 * scale, S);
-    g.strokeRect(0, toPx(k * PITCH - 6), S, 12 * scale);
-  }
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = 4;
-  return t;
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(24, 24);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
 }
 
-function glowTexture() {
-  const c = document.createElement('canvas');
-  c.width = 64; c.height = 64;
-  const g = c.getContext('2d');
-  const grad = g.createRadialGradient(32, 32, 2, 32, 32, 30);
-  grad.addColorStop(0, 'rgba(255, 210, 130, 0.55)');
-  grad.addColorStop(1, 'rgba(255, 210, 130, 0)');
-  g.fillStyle = grad;
-  g.fillRect(0, 0, 64, 64);
-  return new THREE.CanvasTexture(c);
-}
-
-// One car, as few meshes as possible: body (+cabin merged in as a second
-// material group), and wheels/lights live in shared InstancedMeshes.
-function makeCarMesh(color, isPolice) {
-  const group = new THREE.Group();
-  // A little emissive lift so dark paint still reads at dusk.
-  const bodyMat = new THREE.MeshLambertMaterial({ color, emissive: color, emissiveIntensity: 0.28 });
-  const darkMat = lambert(0x11131a);
-  const bodyGeo = new THREE.BoxGeometry(2.1, 0.65, 4.4);
-  bodyGeo.translate(0, 0.55, 0);
-  const cabinGeo = new THREE.BoxGeometry(1.8, 0.6, 2.2);
-  cabinGeo.translate(0, 1.15, -0.2);
-  const merged = mergeGeometries([bodyGeo, cabinGeo], true);
-  const body = new THREE.Mesh(merged, [bodyMat, darkMat]);
-  body.castShadow = true;
-  group.add(body);
-  let lightBarRed = null;
-  let lightBarBlue = null;
-  if (isPolice) {
-    const bar = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.18, 0.4), lambert(0x111111));
-    bar.position.y = 1.55;
-    group.add(bar);
-    lightBarRed = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.2, 0.42), basic(0xff2222));
-    lightBarRed.position.set(-0.35, 1.55, 0);
-    group.add(lightBarRed);
-    lightBarBlue = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.2, 0.42), basic(0x2266ff));
-    lightBarBlue.position.set(0.35, 1.55, 0);
-    group.add(lightBarBlue);
-    // Police livery: a dark stripe along the body.
-    const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.12, 0.3, 4.42), lambert(0x14161c));
-    stripe.position.y = 0.62;
-    group.add(stripe);
-  }
-  return { group, lightBarRed, lightBarBlue, bodyMat };
-}
-
-// A person: torso + head + arms merged into one mesh (two material groups),
-// legs separate so they can swing. The player's own mesh keeps separate arms
-// so the punch animation can raise one.
-function makePersonMesh(color, armsSeparate) {
-  const group = new THREE.Group();
-  const shirt = new THREE.MeshLambertMaterial({ color });
-  const skin = lambert(0xd9a066);
-  const pants = lambert(0x2a2f3a);
-  const torsoGeo = new THREE.BoxGeometry(0.62, 0.75, 0.36);
-  torsoGeo.translate(0, 1.05, 0);
-  const headGeo = new THREE.SphereGeometry(0.26, 12, 10);
-  headGeo.translate(0, 1.68, 0);
-  const bodyGeos = [torsoGeo, headGeo];
-  const bodyMats = [shirt, skin];
-  let armL = null;
-  let armR = null;
-  if (!armsSeparate) {
-    // Pedestrians: arms merged into the body (they never need to move).
-    const armGeoL = new THREE.BoxGeometry(0.18, 0.65, 0.2);
-    armGeoL.translate(-0.42, 1.05, 0);
-    const armGeoR = new THREE.BoxGeometry(0.18, 0.65, 0.2);
-    armGeoR.translate(0.42, 1.05, 0);
-    bodyGeos.push(armGeoL, armGeoR);
-    bodyMats.push(shirt, shirt);
-  }
-  const body = new THREE.Mesh(mergeGeometries(bodyGeos, true), bodyMats);
-  body.castShadow = true;
-  group.add(body);
-  if (armsSeparate) {
-    // The player's arms stay separate meshes, so the punch can raise one.
-    armL = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.65, 0.2), shirt);
-    armL.position.set(-0.42, 1.05, 0);
-    group.add(armL);
-    armR = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.65, 0.2), shirt);
-    armR.position.set(0.42, 1.05, 0);
-    group.add(armR);
-  }
-  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.7, 0.26), pants);
-  legL.position.set(-0.16, 0.35, 0);
-  group.add(legL);
-  const legR = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.7, 0.26), pants);
-  legR.position.set(0.16, 0.35, 0);
-  group.add(legR);
-  return { group, legL, legR, armL, armR, shirt };
-}
-
-export function createRenderer(canvas, world, initialQuality) {
-  const qualityName = QUALITY[initialQuality] ? initialQuality : 'high';
-  const q = QUALITY[qualityName];
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: qualityName !== 'low' });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, q.pixelRatio));
-  renderer.shadowMap.enabled = q.shadows;
-  renderer.shadowMap.type = THREE.PCFShadowMap;
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
+export function createRenderer(canvas, world, opts = {}) {
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(PALETTE.sky);
-  scene.fog = new THREE.Fog(PALETTE.fog, q.fogNear, q.fogFar);
+  scene.fog = new THREE.Fog(PALETTE.fog, 60, 420);
 
-  const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 900);
+  const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 900);
 
-  // Dusk light: warm low sun + cool ambient. Bright enough to read at a glance.
-  const sun = new THREE.DirectionalLight(0xffb36b, 2.4);
-  sun.position.set(-120, 70, -80);
+  // --- Lights: a low dusk sun, a cool ambient, and the moon's fill. ------
+  const sun = new THREE.DirectionalLight(0xffb36b, 1.6);
+  sun.position.set(-120, 90, 60);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(q.shadowMap, q.shadowMap);
-  sun.shadow.camera.left = -90; sun.shadow.camera.right = 90;
-  sun.shadow.camera.top = 90; sun.shadow.camera.bottom = -90;
-  sun.shadow.camera.far = 400;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.left = -220;
+  sun.shadow.camera.right = 220;
+  sun.shadow.camera.top = 220;
+  sun.shadow.camera.bottom = -220;
+  sun.shadow.camera.far = 500;
   scene.add(sun);
-  scene.add(new THREE.HemisphereLight(0x9a8bd8, 0x3a2c28, 1.3));
-  scene.add(new THREE.AmbientLight(0x606080, 0.75));
+  scene.add(new THREE.AmbientLight(0x8a7fd0, 0.55));
+  const moon = new THREE.DirectionalLight(0x9fb4ff, 0.35);
+  moon.position.set(80, 120, -100);
+  scene.add(moon);
 
-  // Ground with the painted street grid.
+  // --- Sun disc and skyline glow on the horizon. --------------------------
+  const sunDisc = new THREE.Mesh(
+    new THREE.CircleGeometry(26, 32),
+    new THREE.MeshBasicMaterial({ color: PALETTE.sun, fog: false }),
+  );
+  sunDisc.position.set(-260, 42, -40);
+  sunDisc.lookAt(0, 42, 0);
+  scene.add(sunDisc);
+
+  // --- Ground, roads and sidewalks. ---------------------------------------
+  const groundTex = makeGroundTexture();
   const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(CITY_SIZE, CITY_SIZE),
-    new THREE.MeshLambertMaterial({ map: groundTexture() }),
+    new THREE.PlaneGeometry(CITY_HALF * 2 + PITCH * 2, CITY_HALF * 2 + PITCH * 2),
+    new THREE.MeshLambertMaterial({ map: groundTex, color: 0xffffff }),
   );
   ground.rotation.x = -Math.PI / 2;
   ground.receiveShadow = true;
   scene.add(ground);
 
-  // Low sun disc on the horizon.
-  const sunDisc = new THREE.Mesh(
-    new THREE.CircleGeometry(26, 32),
-    new THREE.MeshBasicMaterial({ color: PALETTE.sun, fog: false }),
-  );
-  sunDisc.position.set(-320, 42, -260);
-  sunDisc.lookAt(0, 42, 0);
-  scene.add(sunDisc);
+  const roadMat = lambert(PALETTE.road);
+  const walkMat = lambert(PALETTE.sidewalk);
+  const roadGeos = [];
+  const walkGeos = [];
+  for (let i = 0; i < STREETS; i += 1) {
+    const c = streetCoord(i);
+    const len = CITY_HALF * 2 + PITCH;
+    const roadX = new THREE.BoxGeometry(len, 0.1, STREET_HALF * 2);
+    roadX.translate(0, 0.05, c);
+    roadGeos.push(roadX);
+    const roadZ = new THREE.BoxGeometry(STREET_HALF * 2, 0.1, len);
+    roadZ.translate(c, 0.05, 0);
+    roadGeos.push(roadZ);
+    const walkX1 = new THREE.BoxGeometry(len, 0.12, 3);
+    walkX1.translate(0, 0.06, c + STREET_HALF + 1.5);
+    walkGeos.push(walkX1);
+    const walkX2 = new THREE.BoxGeometry(len, 0.12, 3);
+    walkX2.translate(0, 0.06, c - STREET_HALF - 1.5);
+    walkGeos.push(walkX2);
+    const walkZ1 = new THREE.BoxGeometry(3, 0.12, len);
+    walkZ1.translate(c + STREET_HALF + 1.5, 0.06, 0);
+    walkGeos.push(walkZ1);
+    const walkZ2 = new THREE.BoxGeometry(3, 0.12, len);
+    walkZ2.translate(c - STREET_HALF - 1.5, 0.06, 0);
+    walkGeos.push(walkZ2);
+  }
+  const roads = new THREE.Mesh(mergeGeometries(roadGeos), roadMat);
+  roads.receiveShadow = true;
+  scene.add(roads);
+  const walks = new THREE.Mesh(mergeGeometries(walkGeos), walkMat);
+  walks.receiveShadow = true;
+  scene.add(walks);
 
-  // Buildings, merged by facade variant: 4 draw calls for the whole city.
-  // BoxGeometry carries 6 material groups (px, nx, py, ny, pz, nz); merging
-  // with groups keeps them, so [side, side, top, roof, side, side] applies.
-  const facadeMats = [];
-  for (let i = 0; i < 4; i += 1) {
-    facadeMats.push(facade(0, facadeTexture('#4a5070', 0.55, i + 1)));
+  // --- Buildings: merged per facade variant, walls / top / roof separate. --
+  const facadeColors = ['#5a5f7a', '#7a5a5f', '#4f6a72', '#8a6f4d', '#6a5a8a', '#55684f'];
+  const facadeTextures = facadeColors.map((c, i) => makeFacadeTexture(c, 0.35, 1234 + i * 777));
+  const topMat = lambert(0x3a3f55);
+  const roofMat = lambert(0x2c2f42);
+  const byFacade = [[], [], [], [], [], []];
+  for (const b of world.buildings) {
+    const geo = new THREE.BoxGeometry(b.w, b.h, b.d);
+    geo.translate(b.x, b.h / 2, b.z);
+    byFacade[b.facade].push(geo);
   }
-  const roofMat = lambert(0x1c1e28);
-  const topMat = lambert(0x2a2d3a);
-  const boxGeo = new THREE.BoxGeometry(1, 1, 1);
-  const byFacade = [[], [], [], []];
-  for (let i = 0; i < world.buildings.length; i += 1) {
-    const b = world.buildings[i];
-    const g = boxGeo.clone();
-    g.scale(b.w, b.h, b.d);
-    g.translate(b.x, b.h / 2, b.z);
-    byFacade[i % 4].push(g);
-  }
-  for (let v = 0; v < 4; v += 1) {
-    const merged = mergeGeometries(byFacade[v], true);
-    const mesh = new THREE.Mesh(merged, [facadeMats[v], facadeMats[v], topMat, roofMat, facadeMats[v], facadeMats[v]]);
+  for (let v = 0; v < 6; v += 1) {
+    if (!byFacade[v].length) continue;
+    // Remap each box's six groups (px, nx, py, ny, pz, nz) to
+    // [side, side, top, roof, side, side] so every tower draws fully.
+    const merged = mergeGeometries(byFacade[v], true, (gi, k) => BOX_FACE_MAP[k]);
+    const mats = [facade(facadeColors[v], facadeTextures[v]), topMat, roofMat];
+    const mesh = new THREE.Mesh(merged, mats);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     scene.add(mesh);
   }
 
-  // Streetlights at intersections, merged: poles, heads, glow pools.
-  const glowTex = glowTexture();
+  // --- Streetlights: merged poles, merged lamp heads, one glow material. ---
   const poleGeos = [];
   const headGeos = [];
-  const poolGeos = [];
-  const poleGeo = new THREE.CylinderGeometry(0.09, 0.12, 5.4, 6);
-  const headGeo = new THREE.SphereGeometry(0.22, 8, 6);
-  const poolGeo = new THREE.PlaneGeometry(9, 9);
-  for (let i = -4; i <= 4; i += 1) {
-    for (let j = -4; j <= 4; j += 1) {
-      if ((i + j) % 2 !== 0) continue;
-      const x = i * PITCH + 7;
-      const z = j * PITCH + 7;
-      const pg = poleGeo.clone(); pg.translate(x, 2.7, z); poleGeos.push(pg);
-      const hg = headGeo.clone(); hg.translate(x, 5.5, z); headGeos.push(hg);
-      const og = poolGeo.clone(); og.rotateX(-Math.PI / 2); og.translate(x, 0.05, z); poolGeos.push(og);
-    }
+  for (const light of world.streetlights) {
+    const pole = new THREE.CylinderGeometry(0.12, 0.16, 5.4, 6);
+    pole.translate(light.x, 2.7, light.z);
+    poleGeos.push(pole);
+    const head = new THREE.SphereGeometry(0.35, 8, 6);
+    head.translate(light.x, 5.5, light.z);
+    headGeos.push(head);
   }
-  scene.add(new THREE.Mesh(mergeGeometries(poleGeos), lambert(0x22242e)));
-  scene.add(new THREE.Mesh(mergeGeometries(headGeos), basic(PALETTE.lamp)));
-  const poolMat = new THREE.MeshBasicMaterial({ map: glowTex, transparent: true, depthWrite: false });
-  scene.add(new THREE.Mesh(mergeGeometries(poolGeos), poolMat));
-
-  // Traffic lights at the four signalised intersections: one merged pole set,
-  // and red/green lamps as InstancedMeshes toggled by the world state.
-  const lightPoleGeos = [];
-  const lampGeo = new THREE.SphereGeometry(0.28, 8, 6);
-  for (const [lx, lz] of TRAFFIC_LIGHTS) {
-    const pg = poleGeo.clone(); pg.translate(lx + 7, 2.7, lz + 7); lightPoleGeos.push(pg);
-  }
-  scene.add(new THREE.Mesh(mergeGeometries(lightPoleGeos), lambert(0x22242e)));
-  const redLamps = new THREE.InstancedMesh(lampGeo, basic(0xff2a22), TRAFFIC_LIGHTS.length);
-  const greenLamps = new THREE.InstancedMesh(lampGeo, basic(0x2ecc71), TRAFFIC_LIGHTS.length);
-  scene.add(redLamps);
-  scene.add(greenLamps);
-  const lampDummy = new THREE.Object3D();
-  function syncTrafficLights() {
-    const states = world.lightState();
-    for (let i = 0; i < states.length; i += 1) {
-      const s = states[i];
-      // Red lamp on top, green below; the lit one is full size, the other shrunk away.
-      lampDummy.position.set(s.x + 7, 5.6, s.z + 7);
-      lampDummy.scale.setScalar(s.nsGreen ? 0.001 : 1);
-      lampDummy.updateMatrix();
-      redLamps.setMatrixAt(i, lampDummy.matrix);
-      lampDummy.position.set(s.x + 7, 5.0, s.z + 7);
-      lampDummy.scale.setScalar(s.nsGreen ? 1 : 0.001);
-      lampDummy.updateMatrix();
-      greenLamps.setMatrixAt(i, lampDummy.matrix);
-    }
-    redLamps.instanceMatrix.needsUpdate = true;
-    greenLamps.instanceMatrix.needsUpdate = true;
-  }
-
-  // Mission beacon: a light column + a spinning diamond.
-  const beacon = new THREE.Mesh(
-    new THREE.CylinderGeometry(1.6, 1.6, 60, 12, 1, true),
-    new THREE.MeshBasicMaterial({ color: PALETTE.mission, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false }),
+  const poles = new THREE.Mesh(mergeGeometries(poleGeos), lambert(0x2a2a33));
+  scene.add(poles);
+  const lampHeads = new THREE.Mesh(
+    mergeGeometries(headGeos),
+    new THREE.MeshBasicMaterial({ color: PALETTE.lamp }),
   );
-  beacon.visible = false;
-  scene.add(beacon);
-  const diamond = new THREE.Mesh(
-    new THREE.OctahedronGeometry(1.6),
+  scene.add(lampHeads);
+  const lampLights = [];
+  for (let i = 0; i < world.streetlights.length; i += 4) {
+    const s = world.streetlights[i];
+    const point = new THREE.PointLight(0xffd9a0, 12, 26, 1.8);
+    point.position.set(s.x, 5.2, s.z);
+    scene.add(point);
+    lampLights.push(point);
+  }
+
+  // --- Traffic lights: a pole, a housing, and two lamp lenses each. --------
+  const trafficLightMeshes = [];
+  for (const light of world.trafficLights) {
+    const group = new THREE.Group();
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.14, 4.6, 6), lambert(0x2a2a33));
+    pole.position.y = 2.3;
+    group.add(pole);
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(0.5, 1.1, 0.5), lambert(0x1a1a20));
+    housing.position.y = 4.8;
+    group.add(housing);
+    const red = new THREE.Mesh(new THREE.SphereGeometry(0.16, 8, 6), new THREE.MeshBasicMaterial({ color: 0xff2222 }));
+    red.position.set(0, 5.05, 0.28);
+    group.add(red);
+    const green = new THREE.Mesh(new THREE.SphereGeometry(0.16, 8, 6), new THREE.MeshBasicMaterial({ color: 0x22ff66 }));
+    green.position.set(0, 4.55, 0.28);
+    group.add(green);
+    group.position.set(light.x + STREET_HALF + 0.6, 0, light.z + STREET_HALF + 0.6);
+    scene.add(group);
+    trafficLightMeshes.push({ group, red, green, light });
+  }
+
+  // --- Mission beacon: a glowing column + a floating diamond at the target. --
+  const beacon = new THREE.Group();
+  const beaconBeam = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.2, 1.6, 30, 12, 1, true),
+    new THREE.MeshBasicMaterial({ color: PALETTE.mission, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false }),
+  );
+  beaconBeam.position.y = 15;
+  beacon.add(beaconBeam);
+  const beaconDiamond = new THREE.Mesh(
+    new THREE.OctahedronGeometry(1.1),
     new THREE.MeshBasicMaterial({ color: PALETTE.mission }),
   );
-  diamond.visible = false;
-  scene.add(diamond);
+  beaconDiamond.position.y = 8;
+  beacon.add(beaconDiamond);
+  beacon.visible = false;
+  scene.add(beacon);
 
-  // Cash pickups: spinning green octahedra.
-  const pickupGeo = new THREE.OctahedronGeometry(0.8);
-  const pickupMat = basic(0x2ecc71);
-  const pickupMeshes = [];
-  for (let i = 0; i < world.state.pickups.length; i += 1) {
-    const m = new THREE.Mesh(pickupGeo, pickupMat);
-    scene.add(m);
-    pickupMeshes.push(m);
-  }
-
-  // Car wheels: one InstancedMesh for every wheel of every car. Slots are
-  // handed out per car id and released when the car goes inactive.
-  const WHEEL_CAP = 64 * 4;
-  const wheels = new THREE.InstancedMesh(
-    new THREE.CylinderGeometry(0.36, 0.36, 0.3, 12),
-    lambert(0x0a0a0a),
-    WHEEL_CAP,
-  );
-  wheels.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  scene.add(wheels);
-  const wheelSlots = new Map();
-  const freeWheelSlots = [];
-  let nextWheelSlot = 0;
-  const wheelAngle = new Map();
-  const wheelDummy = new THREE.Object3D();
-  const wheelOffsets = [[-0.95, 1.45], [0.95, 1.45], [-0.95, -1.45], [0.95, -1.45]];
-  // Headlights / taillights, also instanced (2 per car each).
-  const LIGHT_CAP = 64 * 2;
-  const headlights = new THREE.InstancedMesh(new THREE.BoxGeometry(0.35, 0.15, 0.1), basic(0xfff2b0), LIGHT_CAP);
-  const taillights = new THREE.InstancedMesh(new THREE.BoxGeometry(0.4, 0.16, 0.1), basic(0xff2a22), LIGHT_CAP);
-  headlights.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  taillights.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  scene.add(headlights);
-  scene.add(taillights);
-  const lightSlots = new Map();
-  const freeLightSlots = [];
-  let nextLightSlot = 0;
-
-  function allocSlot(map, freeList, nextRef) {
-    if (freeList.length > 0) return freeList.pop();
-    if (nextRef.value >= 64) return -1;
-    const slot = nextRef.value;
-    nextRef.value += 1;
-    return slot;
-  }
-
+  // --- Car factory: one group per car, body + cabin merged, wheels spin. ----
   const carMeshes = new Map();
-  const pedMeshes = new Map();
-  const playerMesh = makePersonMesh(PALETTE.playerJacket, true);
-  scene.add(playerMesh.group);
-
-  const cam = { pitch: FEEL.camPitch, dist: FEEL.camDist, smoothYaw: Math.PI };
-  let view = { w: 1, h: 1 };
-  let lastNow = performance.now() / 1000;
-
-  function angleDiff(a, b) {
-    let d = a - b;
-    while (d > Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    return d;
+  function buildCarMesh(car) {
+    const group = new THREE.Group();
+    const bodyGeo = new THREE.BoxGeometry(2.0, 0.62, 4.4);
+    bodyGeo.translate(0, 0.55, 0);
+    const cabinGeo = new THREE.BoxGeometry(1.7, 0.55, 2.2);
+    cabinGeo.translate(0, 1.08, -0.25);
+    const body = new THREE.Mesh(
+      mergeGeometries([bodyGeo, cabinGeo], true),
+      [lambert(car.color), lambert(0x11131c)],
+    );
+    body.castShadow = true;
+    group.add(body);
+    // Police light bar.
+    let lightBar = null;
+    if (car.type === 'police') {
+      lightBar = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.18, 0.5), new THREE.MeshBasicMaterial({ color: 0xff2222 }));
+      lightBar.position.set(0, 1.42, -0.25);
+      group.add(lightBar);
+    }
+    // Rear lights: a red strip so a car reads from behind — the player's
+    // own car used to look dark from the chase camera.
+    const tail = new THREE.Mesh(
+      new THREE.BoxGeometry(1.7, 0.16, 0.08),
+      new THREE.MeshBasicMaterial({ color: 0xff2a22 }),
+    );
+    tail.position.set(0, 0.72, -2.21);
+    group.add(tail);
+    const wheelGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.3, 10);
+    wheelGeo.rotateZ(Math.PI / 2);
+    const wheelMat = lambert(0x0c0c10);
+    const wheels = [];
+    for (const [wx, wz] of [[-1.0, 1.45], [1.0, 1.45], [-1.0, -1.45], [1.0, -1.45]]) {
+      const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+      wheel.position.set(wx, 0.36, wz);
+      wheel.castShadow = true;
+      group.add(wheel);
+      wheels.push(wheel);
+    }
+    group.position.set(car.x, 0, car.z);
+    group.rotation.y = car.heading;
+    scene.add(group);
+    const entry = { group, wheels, lightBar, car };
+    carMeshes.set(car.id, entry);
+    return entry;
   }
+
+  // --- Person factory: merged torso + head + arms, legs swing separately. ---
+  const personMeshes = new Map();
+  function buildPersonMesh(key, color, jacketColor) {
+    const group = new THREE.Group();
+    const torsoGeo = new THREE.BoxGeometry(0.62, 0.78, 0.36);
+    torsoGeo.translate(0, 1.05, 0);
+    const headGeo = new THREE.BoxGeometry(0.36, 0.36, 0.36);
+    headGeo.translate(0, 1.66, 0);
+    const armLGeo = new THREE.BoxGeometry(0.18, 0.66, 0.18);
+    armLGeo.translate(-0.42, 1.05, 0);
+    const armRGeo = new THREE.BoxGeometry(0.18, 0.66, 0.18);
+    armRGeo.translate(0.42, 1.05, 0);
+    const upper = new THREE.Mesh(
+      mergeGeometries([torsoGeo, headGeo, armLGeo, armRGeo], true),
+      [lambert(jacketColor), lambert(0xd9a066), lambert(jacketColor), lambert(jacketColor)],
+    );
+    upper.castShadow = true;
+    group.add(upper);
+    const legMat = lambert(0x2a2d3a);
+    const legGeo = new THREE.BoxGeometry(0.22, 0.72, 0.22);
+    legGeo.translate(0, -0.36, 0);
+    const legL = new THREE.Mesh(legGeo, legMat);
+    legL.position.set(-0.16, 0.72, 0);
+    legL.castShadow = true;
+    group.add(legL);
+    const legR = new THREE.Mesh(legGeo, legMat);
+    legR.position.set(0.16, 0.72, 0);
+    legR.castShadow = true;
+    group.add(legR);
+    scene.add(group);
+    const entry = { group, legL, legR, upper };
+    personMeshes.set(key, entry);
+    return entry;
+  }
+
+  // --- Pickups: floating gold crates that spin. ------------------------------
+  const pickupMeshes = [];
+  for (const pickup of world.pickups) {
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(0.7, 0.7, 0.7),
+      new THREE.MeshBasicMaterial({ color: 0xffd23f }),
+    );
+    mesh.position.set(pickup.x, 1.0, pickup.z);
+    mesh.castShadow = true;
+    scene.add(mesh);
+    pickupMeshes.push({ mesh, pickup });
+  }
+
+  // The player: teal jacket, easy to spot in the crowd.
+  const playerEntry = buildPersonMesh('player', PALETTE.playerJacket, PALETTE.playerJacket);
+  const pedEntries = new Map();
+  world.peds.forEach((ped, i) => {
+    pedEntries.set(i, buildPersonMesh(`ped-${i}`, ped.color, ped.color));
+  });
+  const thugEntries = new Map();
+
+  // --- Camera state. ---------------------------------------------------------
+  let camYaw = Math.PI; // behind the player, who starts facing -Z
+  let camPitch = FEEL.camPitch;
+  let camDist = FEEL.camDist;
+  let camPos = new THREE.Vector3(0, 8, 100);
+  let camLook = new THREE.Vector3(0, 1.5, 84);
+
+  let quality = opts.quality || 'high';
+  let autoQuality = opts.autoQuality !== false;
+  let frameTime = 16;
+  let slowFrames = 0;
+
+  function applyQuality() {
+    if (quality === 'high') {
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.shadowMap.enabled = true;
+      sun.castShadow = true;
+    } else if (quality === 'medium') {
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+      renderer.shadowMap.enabled = false;
+      sun.castShadow = false;
+    } else {
+      renderer.setPixelRatio(1);
+      renderer.shadowMap.enabled = false;
+      sun.castShadow = false;
+    }
+    scene.traverse((obj) => {
+      if (obj.material) obj.material.needsUpdate = true;
+    });
+  }
+  applyQuality();
 
   function resize() {
     const w = window.innerWidth;
     const h = window.innerHeight;
-    renderer.setSize(w, h, false);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
-    view = { w, h };
+    renderer.setSize(w, h);
   }
   window.addEventListener('resize', resize);
-  resize();
 
-  function syncCar(car, now, dt) {
-    let entry = carMeshes.get(car.id);
-    if (!entry) {
-      entry = makeCarMesh(car.color, car.kind === 'police');
-      scene.add(entry.group);
-      carMeshes.set(car.id, entry);
-    }
-    const { group } = entry;
-    const active = car.active;
-    group.visible = active;
-    if (!active) {
-      if (wheelSlots.has(car.id)) { freeWheelSlots.push(wheelSlots.get(car.id)); wheelSlots.delete(car.id); }
-      if (lightSlots.has(car.id)) { freeLightSlots.push(lightSlots.get(car.id)); lightSlots.delete(car.id); }
-      return;
-    }
-    group.position.set(car.x, car.wreck ? 0.15 : 0, car.z);
-    group.rotation.y = car.heading;
-    group.rotation.z = car.wreck ? 0.08 : 0;
-    if (car.kind === 'police' && entry.lightBarRed) {
-      const on = Math.sin(now * 6 + car.sirenPhase) > 0;
-      entry.lightBarRed.visible = on;
-      entry.lightBarBlue.visible = !on;
-    }
-    entry.bodyMat.color.setHex(car.wreck ? 0x333333 : car.color);
-    entry.bodyMat.emissive.setHex(car.wreck ? 0x000000 : car.color);
-    // Wheels: allocate a slot once, then spin them with distance travelled.
-    let slot = wheelSlots.get(car.id);
-    if (slot === undefined) {
-      const ref = { value: nextWheelSlot };
-      slot = allocSlot(wheelSlots, freeWheelSlots, ref);
-      nextWheelSlot = ref.value;
-      if (slot >= 0) wheelSlots.set(car.id, slot);
-      wheelAngle.set(car.id, 0);
-    }
-    if (slot !== undefined && slot >= 0) {
-      const angle = (wheelAngle.get(car.id) || 0) + (car.speed * dt) / 0.36;
-      wheelAngle.set(car.id, angle);
-      // Wheel orientation: spin around the cylinder's own axis, lay the axle
-      // across the car, then yaw with the car. One Euler triple cannot say
-      // that, so the matrix is composed by hand.
-      const rotY = new THREE.Matrix4().makeRotationY(car.heading);
-      const rotZ = new THREE.Matrix4().makeRotationZ(Math.PI / 2);
-      const spin = new THREE.Matrix4().makeRotationY(angle);
-      const wheelMat4 = new THREE.Matrix4().multiplyMatrices(rotY, rotZ).multiply(spin);
-      for (let w = 0; w < 4; w += 1) {
-        wheelMat4.setPosition(
-          car.x + Math.sin(car.heading) * wheelOffsets[w][1] + Math.cos(car.heading) * wheelOffsets[w][0],
-          0.36,
-          car.z + Math.cos(car.heading) * wheelOffsets[w][1] - Math.sin(car.heading) * wheelOffsets[w][0],
-        );
-        wheels.setMatrixAt(slot * 4 + w, wheelMat4);
-      }
-      wheels.instanceMatrix.needsUpdate = true;
-    }
-    // Headlights (front) and taillights (rear).
-    let lslot = lightSlots.get(car.id);
-    if (lslot === undefined) {
-      const ref = { value: nextLightSlot };
-      lslot = allocSlot(lightSlots, freeLightSlots, ref);
-      nextLightSlot = ref.value;
-      if (lslot >= 0) lightSlots.set(car.id, lslot);
-    }
-    if (lslot !== undefined && lslot >= 0) {
-      for (let s = 0; s < 2; s += 1) {
-        const sx = s === 0 ? -0.7 : 0.7;
-        wheelDummy.position.set(
-          car.x + Math.sin(car.heading) * 2.22 + Math.cos(car.heading) * sx,
-          0.6,
-          car.z + Math.cos(car.heading) * 2.22 - Math.sin(car.heading) * sx,
-        );
-        wheelDummy.rotation.set(0, car.heading, 0);
-        wheelDummy.updateMatrix();
-        headlights.setMatrixAt(lslot * 2 + s, wheelDummy.matrix);
-        wheelDummy.position.set(
-          car.x - Math.sin(car.heading) * 2.22 + Math.cos(car.heading) * sx,
-          0.6,
-          car.z - Math.cos(car.heading) * 2.22 - Math.sin(car.heading) * sx,
-        );
-        wheelDummy.updateMatrix();
-        taillights.setMatrixAt(lslot * 2 + s, wheelDummy.matrix);
-      }
-      headlights.instanceMatrix.needsUpdate = true;
-      taillights.instanceMatrix.needsUpdate = true;
-    }
-  }
+  function update(dt, input) {
+    const t0 = performance.now();
+    const p = world.player;
 
-  function syncPed(ped, now) {
-    let entry = pedMeshes.get(ped);
-    if (!entry) {
-      entry = makePersonMesh(ped.color, false);
-      scene.add(entry.group);
-      pedMeshes.set(ped, entry);
+    // --- Camera: orbit with the mouse, zoom with the wheel, swing back ------
+    // behind the direction of travel while driving.
+    if (input && input.orbit) {
+      camYaw -= input.orbit.dx * 0.005;
+      camPitch = Math.max(0.08, Math.min(0.9, camPitch + input.orbit.dy * 0.003));
+      camDist = Math.max(FEEL.camMinDist, Math.min(FEEL.camMaxDist, camDist + (input.orbit.wheel || 0) * 0.01));
     }
-    entry.group.visible = ped.active;
-    if (!ped.active) return;
-    entry.group.position.set(ped.x, 0, ped.z);
-    entry.group.rotation.y = ped.heading;
-    const swing = Math.sin(now * 8 + ped.x) * 0.5 * Math.min(1, ped.speed / 3);
-    entry.legL.rotation.x = swing;
-    entry.legR.rotation.x = -swing;
-    if (ped.kind === 'thug') {
-      entry.group.scale.setScalar(1.15);
-      // Telegraph: the shirt glows red while the punch winds up.
-      entry.shirt.emissive.setHex(ped.punchAnim > 0 ? 0x881111 : 0x000000);
+    const moving = p.speed > 3;
+    if (moving && !p.onFoot) {
+      // Ease the camera behind the car.
+      const behind = Math.atan2(-Math.sin(p.heading), -Math.cos(p.heading));
+      let diff = behind - camYaw;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      camYaw += diff * Math.min(1, FEEL.camAlign * dt);
     }
-  }
-
-  function draw(state, screen) {
-    const now = performance.now() / 1000;
-    const dt = Math.min(0.1, Math.max(0, now - lastNow));
-    lastNow = now;
-    const p = state.player;
-    for (const car of state.cars) syncCar(car, now, dt);
-    for (const ped of state.peds) syncPed(ped, now);
-    playerMesh.group.visible = p.onFoot && screen !== 'title';
-    if (p.onFoot) {
-      playerMesh.group.position.set(p.x, 0, p.z);
-      playerMesh.group.rotation.y = p.heading;
-      const swing = Math.sin(now * 9) * 0.5 * Math.min(1, Math.abs(p.speed) / 5);
-      playerMesh.legL.rotation.x = swing;
-      playerMesh.legR.rotation.x = -swing;
-      if (playerMesh.armL) {
-        playerMesh.armL.rotation.x = -swing * 0.7;
-        playerMesh.armR.rotation.x = p.punchAnim > 0 ? -1.6 : swing * 0.7;
-      }
-    }
-    for (let i = 0; i < state.pickups.length; i += 1) {
-      const pk = state.pickups[i];
-      const m = pickupMeshes[i];
-      m.visible = pk.active;
-      if (pk.active) {
-        m.position.set(pk.x, 1.1 + Math.sin(pk.spin) * 0.15, pk.z);
-        m.rotation.y = pk.spin;
-      }
-    }
-    const marker = world.markerPos();
-    if (marker && screen === 'play') {
-      beacon.visible = true;
-      diamond.visible = true;
-      beacon.position.set(marker.x, 30, marker.z);
-      diamond.position.set(marker.x, 9 + Math.sin(now * 2) * 0.6, marker.z);
-      diamond.rotation.y = now * 1.5;
-    } else {
-      beacon.visible = false;
-      diamond.visible = false;
-    }
-    syncTrafficLights();
-    sun.position.set(p.x - 120, 70, p.z - 80);
-    sun.target.position.set(p.x, 0, p.z);
-    sun.target.updateMatrixWorld();
-
-    // Third-person camera: placed at the world's camera yaw, smoothed, looking
-    // at the player. The world owns the yaw (mouse orbit + auto-align); this
-    // file only smooths it so the view never jumps.
-    cam.smoothYaw += angleDiff(state.camYaw, cam.smoothYaw) * 0.2;
-    const camYaw = cam.smoothYaw;
-    const dist = cam.dist;
-    const tx = p.x + Math.sin(camYaw) * dist * Math.cos(cam.pitch);
-    const tz = p.z + Math.cos(camYaw) * dist * Math.cos(cam.pitch);
-    const ty = 2.2 + dist * Math.sin(cam.pitch);
-    camera.position.x += (tx - camera.position.x) * 0.25;
-    camera.position.y += (ty - camera.position.y) * 0.25;
-    camera.position.z += (tz - camera.position.z) * 0.25;
-    camera.lookAt(p.x, 1.6, p.z);
-    renderer.render(scene, camera);
-  }
-
-  function snapCamera(state) {
-    const p = state.player;
-    cam.smoothYaw = state.camYaw;
-    const camYaw = cam.smoothYaw;
-    camera.position.set(
-      p.x + Math.sin(camYaw) * cam.dist * Math.cos(cam.pitch),
-      2.2 + cam.dist * Math.sin(cam.pitch),
-      p.z + Math.cos(camYaw) * cam.dist * Math.cos(cam.pitch),
+    const camTarget = new THREE.Vector3(
+      p.x + Math.sin(camYaw) * Math.cos(camPitch) * camDist,
+      2.2 + Math.sin(camPitch) * camDist,
+      p.z + Math.cos(camYaw) * Math.cos(camPitch) * camDist,
     );
-    camera.lookAt(p.x, 1.6, p.z);
+    camPos.lerp(camTarget, Math.min(1, 8 * dt));
+    const lookTarget = new THREE.Vector3(p.x, 1.6, p.z);
+    camLook.lerp(lookTarget, Math.min(1, 10 * dt));
+    camera.position.copy(camPos);
+    if (world.cameraShake > 0) {
+      camera.position.x += (Math.random() - 0.5) * world.cameraShake * 0.5;
+      camera.position.y += (Math.random() - 0.5) * world.cameraShake * 0.4;
+    }
+    camera.lookAt(camLook);
+
+    // --- Player. -------------------------------------------------------------
+    playerEntry.group.position.set(p.x, 0, p.z);
+    playerEntry.group.rotation.y = p.heading;
+    const walking = p.onFoot && p.speed > 0.5;
+    const swing = walking ? Math.sin(p.walkPhase) * 0.55 : 0;
+    playerEntry.legL.rotation.x = swing;
+    playerEntry.legR.rotation.x = -swing;
+    playerEntry.group.visible = true;
+
+    // --- Cars: sync position, heading, wheels; drop wrecked ones. -----------
+    const seenCarIds = new Set();
+    for (const car of world.cars) {
+      seenCarIds.add(car.id);
+      let entry = carMeshes.get(car.id);
+      if (!entry) entry = buildCarMesh(car);
+      entry.group.position.set(car.x, 0, car.z);
+      entry.group.rotation.y = car.heading;
+      entry.group.visible = !car.wrecked || car.type === 'player';
+      for (const wheel of entry.wheels) wheel.rotation.x = car.wheelSpin;
+      if (entry.lightBar) {
+        // Alternate red / blue with the siren.
+        const phase = Math.floor(world.time * 4) % 2 === 0;
+        entry.lightBar.material.color.setHex(phase ? 0xff2222 : 0x2266ff);
+      }
+      if (car.wrecked) {
+        entry.group.rotation.z = 0.12;
+        entry.group.position.y = 0.1;
+      } else {
+        entry.group.rotation.z = 0;
+        entry.group.position.y = 0;
+      }
+    }
+    for (const [id, entry] of carMeshes) {
+      if (!seenCarIds.has(id)) {
+        scene.remove(entry.group);
+        carMeshes.delete(id);
+      }
+    }
+
+    // --- Pedestrians. ---------------------------------------------------------
+    world.peds.forEach((ped, i) => {
+      const entry = pedEntries.get(i);
+      if (!entry) return;
+      entry.group.position.set(ped.x, 0, ped.z);
+      entry.group.rotation.y = ped.heading;
+      entry.group.visible = ped.state !== 'down';
+      if (ped.state === 'down') {
+        entry.group.rotation.x = Math.PI / 2;
+        entry.group.position.y = 0.3;
+      } else {
+        entry.group.rotation.x = 0;
+        entry.group.position.y = 0;
+        const swingPed = Math.sin(ped.walkPhase) * 0.5;
+        entry.legL.rotation.x = swingPed;
+        entry.legR.rotation.x = -swingPed;
+      }
+    });
+
+    // --- Thugs. ---------------------------------------------------------------
+    const seenThugs = new Set();
+    world.thugs.forEach((thug, i) => {
+      seenThugs.add(i);
+      let entry = thugEntries.get(i);
+      if (!entry) entry = buildPersonMesh(`thug-${i}`, thug.color, thug.color);
+      entry.group.position.set(thug.x, 0, thug.z);
+      entry.group.rotation.y = thug.heading;
+      const swingThug = Math.sin(thug.walkPhase) * 0.5;
+      entry.legL.rotation.x = swingThug;
+      entry.legR.rotation.x = -swingThug;
+      // Windup telegraph: the thug pulses before the punch lands. (The scale
+      // is per-group, so it never touches the shared cached materials.)
+      const windupScale = thug.state === 'windup' ? 1 + Math.sin(world.time * 20) * 0.08 : 1;
+      entry.group.scale.setScalar(windupScale);
+    });
+    for (const [i, entry] of thugEntries) {
+      if (!seenThugs.has(i)) {
+        scene.remove(entry.group);
+        thugEntries.delete(i);
+      }
+    }
+
+    // --- Pickups. ---------------------------------------------------------------
+    for (const { mesh, pickup } of pickupMeshes) {
+      mesh.visible = !pickup.taken;
+      if (!pickup.taken) {
+        mesh.rotation.y = pickup.spin;
+        mesh.position.y = 1.0 + Math.sin(pickup.spin * 2) * 0.15;
+      }
+    }
+
+    // --- Traffic lights: red / green follow the same cycle as the sim. --------
+    for (const { red, green, light } of trafficLightMeshes) {
+      const t = (world.time + light.phase) % 12;
+      const nsGreen = t < 6;
+      red.material.color.setHex(nsGreen ? 0x551111 : 0xff2222);
+      green.material.color.setHex(nsGreen ? 0x22ff66 : 0x115511);
+    }
+
+    // --- Mission beacon. ---------------------------------------------------------
+    // The beacon position is set by main.js through setBeacon(); here we only
+    // spin the diamond and pulse the beam.
+    beaconDiamond.rotation.y += dt * 1.5;
+    beaconBeam.material.opacity = 0.2 + Math.sin(world.time * 3) * 0.08;
+
+    // --- Frame time → auto-quality. ----------------------------------------------
+    renderer.render(scene, camera);
+    const elapsed = performance.now() - t0;
+    frameTime = frameTime * 0.95 + elapsed * 0.05;
+    if (autoQuality && frameTime > 24) {
+      slowFrames += 1;
+      if (slowFrames > 90) {
+        slowFrames = 0;
+        if (quality === 'high') setQuality('medium');
+        else if (quality === 'medium') setQuality('low');
+      }
+    } else {
+      slowFrames = 0;
+    }
+    return { frameTime };
   }
 
-  // Apply a quality tier live. Shadows and fog rebuild; antialias is fixed
-  // at renderer creation, so a tier change notes it but cannot flip it.
-  let currentQuality = qualityName;
-  function applyQuality(name) {
-    if (!QUALITY[name] || name === currentQuality) return false;
-    const nq = QUALITY[name];
-    currentQuality = name;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, nq.pixelRatio));
-    renderer.shadowMap.enabled = nq.shadows;
-    if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
-    sun.shadow.mapSize.set(nq.shadowMap, nq.shadowMap);
-    scene.fog.near = nq.fogNear;
-    scene.fog.far = nq.fogFar;
-    resize();
-    return true;
+  function setQuality(next) {
+    if (quality === next) return;
+    quality = next;
+    applyQuality();
   }
 
-  // Prewarm: compile the scene once so the first real frame does not hitch.
-  renderer.compile(scene, camera);
+  function setBeacon(x, z, visible) {
+    beacon.visible = !!visible;
+    if (visible) beacon.position.set(x, 0, z);
+  }
+
+  function getCameraState() {
+    return { yaw: camYaw, pitch: camPitch, dist: camDist };
+  }
+
+  function setCameraYaw(yaw) {
+    camYaw = yaw;
+  }
+
+  function getQuality() {
+    return quality;
+  }
+
+  function dispose() {
+    window.removeEventListener('resize', resize);
+    renderer.dispose();
+  }
 
   return {
-    draw, snapCamera, cam, scene, renderer, camera, applyQuality,
-    quality() { return currentQuality; },
-    stats() {
-      const info = renderer.info;
-      return { calls: info.render.calls, triangles: info.render.triangles, geometries: info.memory.geometries, textures: info.memory.textures };
-    },
-    viewSize() { return view; },
+    update, setQuality, getQuality, setBeacon,
+    getCameraState, setCameraYaw, dispose,
+    scene, camera, renderer,
   };
 }

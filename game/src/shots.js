@@ -1,516 +1,329 @@
-// The screenshot scenes behind ?shot=start|drive|wanted|mission. Each one plays
-// the real rules forward from a fresh world, steered by an autopilot that walks,
-// steals a car and drives it using the same inputs a player would — so every
-// frame is what real play looks like and the same seed always gives the same
-// frame. Nothing is staged: if the autopilot cannot reach the scene, advance()
-// stops at its time limit and info().success is false (the screenshot script
-// reports that instead of faking the shot).
-import { PITCH } from './config.js';
-import { EVENT_DEATH } from './world.js';
+// Neon Harbor — the screenshot autopilot. Each ?shot= scene is played for
+// real by this driver: it walks, steals a car, drives the street grid and
+// finishes a mission using the same step() the player uses, with the same
+// input shape. Nothing here fakes an outcome — if the pilot cannot steal a
+// car or reach the Docks, the shot does not complete and the run reports it.
+//
+// The driver owns its own phase machine and returns the input for world.step
+// plus the camera yaw it wants, every frame. main.js feeds both in and takes
+// the screenshot when the driver reports done.
+import { MISSIONS, PITCH, STREETS } from './config.js';
+import { streetCoord, missionDef } from './world.js';
 
-const TAU = Math.PI * 2;
-const IDLE = { fwd: 0, strafe: 0, sprint: false, steer: 0, accel: 0, brake: false, e: false, f: false, shoot: false };
+const ACTION_CONFIRM = 1;
+const ACTION_INTERACT = 4;
+const ACTION_PUNCH = 8;
+const ACTION_SHOOT = 16;
 
-function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
-function angleDiff(a, b) { let d = a - b; while (d > Math.PI) d -= TAU; while (d < -Math.PI) d += TAU; return d; }
-function nearestStreet(v) { return Math.round(v / PITCH) * PITCH; }
-function dist(ax, az, bx, bz) { return Math.hypot(ax - bx, az - bz); }
-
-// Manhattan route along streets: nearest intersection, then along one street,
-// then along the cross street, then to the target itself.
-function routeWaypoints(from, to) {
-  const sx = nearestStreet(from.x);
-  const sz = nearestStreet(from.z);
-  const tx = nearestStreet(to.x);
-  const tz = nearestStreet(to.z);
-  const pts = [{ x: sx, z: sz }, { x: tx, z: sz }, { x: tx, z: tz }, { x: to.x, z: to.z }];
-  return pts.filter((p) => dist(from.x, from.z, p.x, p.z) > 5);
-}
-
-function walkInput(state, tx, tz, sprint) {
-  const p = state.player;
-  // Camera-relative: point the camera behind the desired walk direction, then
-  // walk forward away from it.
-  const want = Math.atan2(tx - p.x, tz - p.z);
-  return {
-    ...IDLE,
-    fwd: 1,
-    sprint: !!sprint,
-    camYaw: want + Math.PI,
-  };
-}
-
-let wrongWaySteps = 0;
-let reverseDriveSteps = 0;
-// Consecutive stuck-while-driving resets. At 3 the car is a lost cause
-// (sandwiched between a building and a police car, or wedged too deep for
-// the reverse-out) — the pilot bails out and steals a fresh car instead of
-// grinding there for the rest of the run.
-let driveStuckCount = 0;
-function driveInput(state, tx, tz) {
-  const p = state.player;
-  const car = state.cars.find((c) => c.id === p.carId);
-  const speed = car ? car.speed : 0;
-  // Overtake instead of ramming: if a car is close ahead on our line, aim
-  // at a point offset to the side so we pass it in the next lane. Only
-  // while actually moving — a stationary or wedged car has nothing to
-  // overtake, and letting a nearby police car hijack the aim point would
-  // cancel the reverse-swing that gets it out of the wedge.
-  let ax = tx;
-  let az = tz;
-  let blocked = false;
-  if (car && speed > 5) {
-    const hx = Math.sin(p.heading);
-    const hz = Math.cos(p.heading);
-    let blockD = Infinity;
-    let block = null;
-    for (const o of state.cars) {
-      if (!o.active || o.id === car.id || o.kind === 'player') continue;
-      const dx = o.x - p.x;
-      const dz = o.z - p.z;
-      const fwd = dx * hx + dz * hz;
-      const lat = Math.abs(dx * hz - dz * hx);
-      if (fwd > 0 && fwd < 20 && lat < 4 && fwd < blockD) { block = o; blockD = fwd; }
-    }
-    if (block) {
-      blocked = true;
-      const side = ((block.x - p.x) * hz - (block.z - p.z) * hx) > 0 ? -1 : 1;
-      ax = p.x + hx * 10 + hz * side * 7;
-      az = p.z + hz * 10 - hx * side * 7;
-    }
-  }
-  const want = Math.atan2(ax - p.x, az - p.z);
-  const diff = angleDiff(want, p.heading);
-  const camYaw = p.heading + Math.PI;
-  // Backing out of a wedge (set by the stuck detector): reverse while
-  // steering the nose toward the target, then drive on.
-  if (reverseDriveSteps > 0) {
-    reverseDriveSteps -= 1;
-    return { ...IDLE, brake: true, steer: -clamp(diff, -1, 1), camYaw };
-  }
-  // Wrong-way recovery is a last resort, not a driving mode: only when the
-  // car is nearly stopped AND facing far away (>149°), and only as a brief
-  // 3-point turn — reverse for up to 1.5 s, then drive forward and
-  // re-evaluate. (An earlier version reversed whenever the heading was off
-  // by >114°, which put the car in permanent reverse at the city edge and
-  // let it ping-pong along the boundary instead of turning around.)
-  if (Math.abs(diff) > 2.6 && Math.abs(speed) < 2) {
-    wrongWaySteps += 1;
-    if (wrongWaySteps > 30 && wrongWaySteps < 120) {
-      return { ...IDLE, brake: true, steer: -clamp(diff, -1, 1), camYaw };
-    }
-    if (wrongWaySteps >= 120) wrongWaySteps = 0;
-  } else {
-    wrongWaySteps = 0;
-  }
-  // Slow for a turn by easing off the throttle — never by braking to a stop,
-  // which is what invited the reverse spiral. The car U-turns forward.
-  const bend = Math.abs(diff) > 0.5;
-  return {
-    ...IDLE,
-    steer: clamp(diff * 1.6, -1, 1),
-    accel: bend ? 0.3 : blocked ? 0.4 : 1,
-    brake: false,
-    camYaw,
-  };
-}
-
-function nearestParked(state) {
-  const p = state.player;
-  let best = null;
-  let bestD = Infinity;
-  for (const car of state.cars) {
-    if (!car.active || car.wreck || car.kind !== 'parked') continue;
-    const d = dist(p.x, p.z, car.x, car.z);
-    if (d < bestD) { bestD = d; best = car; }
+function nearestStreetCoord(v) {
+  let best = streetCoord(0);
+  let bestD = Math.abs(v - best);
+  for (let i = 1; i < STREETS; i += 1) {
+    const c = streetCoord(i);
+    const d = Math.abs(v - c);
+    if (d < bestD) { bestD = d; best = c; }
   }
   return best;
 }
 
-function nearestTraffic(state) {
-  const p = state.player;
-  let best = null;
-  let bestD = Infinity;
-  for (const car of state.cars) {
-    if (!car.active || car.kind !== 'traffic') continue;
-    const d = dist(p.x, p.z, car.x, car.z);
-    if (d < bestD) { bestD = d; best = car; }
-  }
-  return best;
+function planRoute(fromX, fromZ, toX, toZ) {
+  // Manhattan route on the street grid, one axis at a time: nearest
+  // intersection, then along that street to the target's street, then along
+  // it to the intersection nearest the target, then the target itself. Every
+  // leg runs along a street — a straight diagonal across the city would cut
+  // through buildings and the car would grind against them forever.
+  const sx = nearestStreetCoord(toX);
+  const sz = nearestStreetCoord(toZ);
+  const ix = nearestStreetCoord(fromX);
+  const iz = nearestStreetCoord(fromZ);
+  return [[ix, iz], [sx, iz], [sx, sz], [toX, toZ]];
 }
 
-function policeNear(state) {
-  const p = state.player;
-  let count = 0;
-  let nearest = Infinity;
-  for (const car of state.cars) {
-    if (!car.active || car.kind !== 'police') continue;
-    count += 1;
-    nearest = Math.min(nearest, dist(p.x, p.z, car.x, car.z));
-  }
-  return { count, nearest };
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
 }
 
-/**
- * Build the named scene. Returns { screen, advance(dt), info() }.
- * advance() steps the world once and returns true while the scene still
- * needs more simulation; when it returns false the frame is ready.
- */
-export function stageShot(name, world, opts = {}) {
-  world.reset();
-  const state = world.state;
-  let simTime = 0;
-  let waypoints = [];
-  let wpIndex = 0;
+export function createShotDriver(world, shotName) {
   let phase = 'start';
-  let success = false;
-  let note = '';
-  // The browser screenshot only needs a real mission moment (mission 1
-  // complete at the Docks). The full story is verified separately in node
-  // with opts.fullStory — it is harder (three missions under heat) and not
-  // every seed finishes it.
-  const needFullStory = !!opts.fullStory;
+  let phaseTime = 0;
+  let route = null;
+  let routeIndex = 0;
+  let stuckTime = 0;
+  let reversing = 0;
+  let camYaw = Math.PI;
+  let done = false;
+  let status = 'starting';
+  let walkStuckTime = 0;
+  let walkLastDist = Infinity;
+  let sidestepTime = 0;
+  let sidestepDir = 1;
 
-  const screen = name === 'start' ? 'title' : 'play';
-  const limit = name === 'start' ? 6 : name === 'wanted' ? 150 : name === 'mission' ? 420 : 120;
-  const target = name === 'drive' ? { x: 156, z: 42 } : null; // the Docks
-  // Story targets per mission,stage — the 'mission' shot plays the whole
-  // story, not just the first objective.
-  const STORY_TARGETS = {
-    '0,1': { x: 156, z: 42 },    // Docks
-    '1,0': { x: -150, z: -126 }, // pickup warehouse
-    '1,1': { x: 150, z: 126 },   // Marina
-    '2,1': { x: -126, z: 150 },  // Hideout
-  };
-  const EVADE_CORNERS = [
-    { x: -150, z: 150 }, { x: 150, z: -150 },
-    { x: -150, z: -126 }, { x: 150, z: 126 },
-  ];
-  let evadeTarget = null;
-  let evadeHide = false;
-  let hideSpot = null;
-  // Hiding spot for the Heat evade: the block centre 60 m from the ditch
-  // point toward the city centre, snapped to the block grid (block centres
-  // sit at i*42+21). Far enough that the police searching the ditch point
-  // are past the 35 m decay distance, and inside a block so their cars
-  // cannot drive straight at the player.
-  function hideSpotFor(corner) {
-    const len = Math.hypot(corner.x, corner.z) || 1;
-    const hx = corner.x - (corner.x / len) * 60;
-    const hz = corner.z - (corner.z / len) * 60;
-    return {
-      x: Math.round((hx - 21) / 42) * 42 + 21,
-      z: Math.round((hz - 21) / 42) * 42 + 21,
-    };
-  }
-  let lastInput = null;
-
-  // Waypoint walking: follow the street route instead of a straight line,
-  // which would run the player into the buildings between streets. Each
-  // purpose gets its OWN walker: stealing a car and walking to a mission
-  // target must not share route state, or the two targets fight over the
-  // waypoints and the pilot ping-pongs between them.
-  function makeWalker() {
-    let wps = [];
-    let index = 0;
-    let key = '';
-    return {
-      reset() { wps = []; index = 0; key = ''; },
-      go(tx, tz, sprint) {
-        const p = state.player;
-        // Close in already: walk straight at the target instead of routing
-        // via the street grid (whose first point may be behind the player).
-        if (dist(p.x, p.z, tx, tz) < 12) return walkInput(state, tx, tz, sprint);
-        const k = `${Math.round(tx)},${Math.round(tz)}`;
-        if (k !== key || index >= wps.length) {
-          key = k;
-          wps = routeWaypoints(p, { x: tx, z: tz });
-          index = 0;
-        }
-        const wp = wps[index];
-        lastWp = wp;
-        if (dist(p.x, p.z, wp.x, wp.z) < 3) {
-          index += 1;
-          if (index >= wps.length) return walkInput(state, tx, tz, sprint);
-          return walkInput(state, wps[index].x, wps[index].z, sprint);
-        }
-        return walkInput(state, wp.x, wp.z, sprint);
-      },
-      get index() { return index; },
-      get len() { return wps.length; },
-      get targetKey() { return key; },
-    };
-  }
-  const missionWalker = makeWalker();
-  const stealWalker = makeWalker();
-
-  // Unstick reverse: set by the stuck detector (position barely changed
-  // for 2 s while driving) — the next driveInput calls back out of the
-  // wedge for 1.5 s before resuming normal driving.
-  let lastTarget = null;
-  let lastWp = null;
-  // Stuck detection: sample the position once a second; if the pilot is
-  // commanding movement but the player covered under 1 m in that second
-  // (wedged in a building after a shove, or pushed off the route), throw
-  // the routes away so they are rebuilt from where the player actually is
-  // — the first waypoint is then the nearest street, which is also the way
-  // out of the building. Two stuck seconds in a row trigger the reset.
-  let sampleX = 0;
-  let sampleZ = 0;
-  let sampleT = 0;
-  let stuckSecs = 0;
-  function stepWorld(dt, input) {
-    const events = world.step(dt, input);
-    if (events & EVENT_DEATH) world.respawnAfterDeath();
-    const p = state.player;
-    const moving = (input.fwd || 0) > 0 || (input.accel || 0) > 0 || input.brake;
-    sampleT += dt;
-    if (sampleT >= 1) {
-      if (moving && dist(p.x, p.z, sampleX, sampleZ) < 1) {
-        stuckSecs += 1;
-        if (stuckSecs >= 2) {
-          stuckSecs = 0;
-          waypoints = [];
-          wpIndex = 0;
-          driveTargetKey = '';
-          missionWalker.reset();
-          stealWalker.reset();
-          // Back out of the wedge before re-routing: a car pinned against
-          // a building by police rams will just grind into the wall if it
-          // keeps aiming at the waypoint.
-          reverseDriveSteps = 90;
-          if (!p.onFoot) driveStuckCount += 1;
-        }
-      } else {
-        stuckSecs = 0;
-        if (dist(p.x, p.z, sampleX, sampleZ) > 5) driveStuckCount = 0;
+  function walkTo(tx, tz, dt) {
+    const p = world.player;
+    // Walk the street grid, not a straight line: a direct line to the target
+    // cuts through buildings, and sliding along a wall shrinks the distance
+    // just slowly enough that the unstuck logic never fires. The Manhattan
+    // route's legs all run along streets, so follow its first waypoint that
+    // is still more than 2 m away (the last waypoint is the target itself).
+    const route = planRoute(p.x, p.z, tx, tz);
+    // Walk the first waypoint that is still ahead of the player. The route's
+    // first point is the intersection nearest the player, which is BEHIND
+    // them once they have walked a few metres along the street — picking it
+    // makes the player walk back south, then north again, oscillating around
+    // the start forever. A waypoint counts as ahead when it lies in the same
+    // half-plane as the target (positive dot product with the target
+    // direction); the last waypoint is the target itself.
+    const tdx = tx - p.x;
+    const tdz = tz - p.z;
+    let wx = tx;
+    let wz = tz;
+    for (const [rx, rz] of route) {
+      if (Math.hypot(rx - p.x, rz - p.z) > 2 && (rx - p.x) * tdx + (rz - p.z) * tdz > 0) {
+        wx = rx;
+        wz = rz;
+        break;
       }
-      if (p.onFoot) driveStuckCount = 0;
-      sampleX = p.x;
-      sampleZ = p.z;
-      sampleT = 0;
     }
-    return events;
-  }
-
-  function goSteal() {
-    // Parked cars first; if the city's parked supply is all wrecked, fall
-    // back to the slowest nearby traffic car (one stopped at a light is
-    // catchable on foot — a fast one is not).
-    let car = nearestParked(state);
-    if (!car) {
-      let bestScore = Infinity;
-      for (const c of state.cars) {
-        if (!c.active || c.wreck || c.kind !== 'traffic') continue;
-        const d = dist(state.player.x, state.player.z, c.x, c.z);
-        const score = d + Math.abs(c.speed) * 3;
-        if (d < 60 && score < bestScore) { bestScore = score; car = c; }
-      }
-      if (car) lastTarget = { x: car.x, z: car.z, kind: car.kind };
-    }
-    if (!car) return IDLE;
-    lastTarget = { x: car.x, z: car.z, kind: car.kind };
-    const d = dist(state.player.x, state.player.z, car.x, car.z);
-    if (d < 4) return { ...IDLE, e: true };
-    // A moving traffic car gets a straight chase, not a street route: the
-    // route's first point would be behind the player by the time it is used.
-    if (car.kind === 'traffic') return walkInput(state, car.x, car.z, true);
-    return stealWalker.go(car.x, car.z, true);
-  }
-
-  let driveTargetKey = '';
-  function goDriveTo(tx, tz) {
-    const p = state.player;
-    // Bail out of a hopeless car: three stuck resets in a row means the
-    // reverse-outs are not freeing it (sandwiched by a building and a
-    // police car). Get out and steal a fresh one.
-    if (driveStuckCount >= 3) return { ...IDLE, e: true };
-    const key = `${tx},${tz}`;
-    if (key !== driveTargetKey || waypoints.length === 0 || wpIndex >= waypoints.length) {
-      driveTargetKey = key;
-      waypoints = routeWaypoints(p, { x: tx, z: tz });
-      wpIndex = 0;
-    }
-    const wp = waypoints[wpIndex];
-    if (dist(p.x, p.z, wp.x, wp.z) < 6) {
-      wpIndex += 1;
-      if (wpIndex >= waypoints.length) return { ...IDLE, accel: 0 };
-      return driveInput(state, waypoints[wpIndex].x, waypoints[wpIndex].z);
-    }
-    return driveInput(state, wp.x, wp.z);
-  }
-
-  function advance(dt) {
-    simTime += dt;
-    if (name === 'start') {
-      stepWorld(dt, IDLE);
-      if (simTime >= 6) { success = true; note = 'ambient city, 6s'; return false; }
-      return true;
-    }
-    if (simTime > limit + 0.001) {
-      note = `time limit ${limit}s reached in phase ${phase}`;
-      return false;
-    }
-    const p = state.player;
-    let input = IDLE;
-
-    if (name === 'wanted') {
-      if (p.onFoot) {
-        input = goSteal();
-        phase = 'steal';
-      } else if (state.wanted < 2) {
-        // Ram the nearest traffic car to earn the second star.
-        const t = nearestTraffic(state);
-        if (!t) { input = { ...IDLE, accel: 1 }; }
-        else {
-          // Aim at where the traffic car will be.
-          const px = t.x + Math.sin(t.heading) * t.speed * 0.6;
-          const pz = t.z + Math.cos(t.heading) * t.speed * 0.6;
-          input = driveInput(state, px, pz);
-        }
-        phase = 'ram';
-      } else {
-        const { count, nearest } = policeNear(state);
-        const moving = state.player.onFoot ? Math.abs(state.player.speed) > 2 : Math.abs((state.cars.find((c) => c.id === state.player.carId) || { speed: 0 }).speed) > 5;
-        if (count >= 1 && nearest < 60 && moving) {
-          success = true;
-          note = `wanted ${state.wanted} stars, ${count} police, nearest ${Math.round(nearest)}m`;
-          return false;
-        }
-        // Keep driving so the chase stays lively while police close in.
-        const t = nearestTraffic(state);
-        input = t ? driveInput(state, t.x, t.z) : { ...IDLE, accel: 1 };
-        phase = 'chase';
-      }
-      stepWorld(dt, input);
-      return true;
-    }
-
-    if (name === 'mission') {
-      // Play the story. The screenshot succeeds at mission 1 complete (the
-      // Docks); the full-story check (opts.fullStory) keeps playing until
-      // the story is actually complete.
-      if (state.missionIndex >= 3) {
-        success = true;
-        note = `story complete, cash $${state.cash}, wanted ${state.wanted}`;
-        return false;
-      }
-      if (!needFullStory && state.missionIndex >= 1) {
-        success = true;
-        note = `mission 1 complete, cash $${state.cash}, wanted ${state.wanted}`;
-        return false;
-      }
-      const key = `${state.missionIndex},${state.missionStage}`;
-      let mTarget = STORY_TARGETS[key] || null;
-      if (state.missionIndex === 2 && state.missionStage === 0) {
-        // Heat: drive to a far corner, ditch the car, and hide on foot
-        // inside a block. Police cars cannot follow through buildings —
-        // they must drive around the block while the player cuts straight
-        // through it — which is what opens the gap the wanted decay needs.
-        // Looping corners at full speed never opened that gap: the police
-        // are nearly as fast as the player car and the chase never broke.
-        if (p.onFoot) {
-          if (evadeHide && hideSpot) {
-            if (dist(p.x, p.z, hideSpot.x, hideSpot.z) < 5) {
-              // Hidden: wait for the stars to fall off.
-              input = IDLE;
-              phase = 'hide';
-            } else {
-              input = missionWalker.go(hideSpot.x, hideSpot.z, true);
-              phase = 'hide';
-            }
-            stepWorld(dt, input);
-            return true;
-          }
-          // No car (wrecked before the corner): steal one and try again.
-          evadeHide = false;
-          input = goSteal();
-          phase = 'steal';
-          stepWorld(dt, input);
-          return true;
-        }
-        if (!evadeTarget) {
-          evadeTarget = EVADE_CORNERS.reduce((a, b) =>
-            dist(p.x, p.z, a.x, a.z) > dist(p.x, p.z, b.x, b.z) ? a : b);
-          waypoints = [];
-          wpIndex = 0;
-        }
-        if (dist(p.x, p.z, evadeTarget.x, evadeTarget.z) < 15) {
-          // Arrived at the corner: stop, ditch the car, hide on foot.
-          const car = state.cars.find((c) => c.id === p.carId);
-          if (car && Math.abs(car.speed) > 2) {
-            input = { ...IDLE, brake: true };
-            phase = 'ditch';
-          } else {
-            evadeHide = true;
-            hideSpot = hideSpotFor(evadeTarget);
-            evadeTarget = null;
-            input = { ...IDLE, e: true };
-            phase = 'ditch';
-          }
-          stepWorld(dt, input);
-          return true;
-        }
-        mTarget = evadeTarget;
-        phase = 'evade';
-      } else if (mTarget) {
-        phase = 'drive';
-      }
-      const dTarget = mTarget ? dist(p.x, p.z, mTarget.x, mTarget.z) : Infinity;
-      if (p.onFoot) {
-        input = mTarget && dTarget < 15
-          ? missionWalker.go(mTarget.x, mTarget.z, true)
-          : goSteal();
-        phase = mTarget && dTarget < 50 ? 'walk' : 'steal';
-        stepWorld(dt, input);
-        return true;
-      }
-      if (!mTarget) { stepWorld(dt, IDLE); return true; }
-      input = goDriveTo(mTarget.x, mTarget.z);
-      lastInput = input;
-      stepWorld(dt, input);
-      return true;
-    }
-
-    // drive: steal a car, then drive to the Docks. Reaching the target
-    // counts on foot too — a wrecked car 40 m short is not a failure.
-    const dTarget = target ? dist(p.x, p.z, target.x, target.z) : Infinity;
-    if (target && dTarget < 14) {
-      success = true;
-      note = `reached the Docks, cash $${state.cash}, wanted ${state.wanted}`;
-      return false;
-    }
-    if (p.onFoot) {
-      input = target && dTarget < 15
-        ? missionWalker.go(target.x, target.z, true)
-        : goSteal();
-      phase = target && dTarget < 50 ? 'walk' : 'steal';
-      stepWorld(dt, input);
-      return true;
-    }
-    phase = 'drive';
-    input = goDriveTo(target.x, target.z);
-    stepWorld(dt, input);
-    // If the car was wrecked, the world puts the player back on foot and the
-    // steal phase above picks a new car.
-    return true;
-  }
-
-  return {
-    screen,
-    advance,
-    info() {
+    const dx = wx - p.x;
+    const dz = wz - p.z;
+    const dist = Math.hypot(tx - p.x, tz - p.z);
+    camYaw = Math.atan2(-dx, -dz);
+    // Unstuck: walking straight at a target through a building slides along
+    // the wall forever. If the distance has not shrunk in 2.5 s, sidestep
+    // for 1.5 s to walk around the obstacle, then re-aim.
+    if (sidestepTime > 0) {
+      sidestepTime -= dt;
       return {
-        shot: name, success, note, simTime: Math.round(simTime * 10) / 10,
-        wanted: state.wanted, cash: state.cash,
-        missionIndex: state.missionIndex, missionStage: state.missionStage,
-        player: { x: Math.round(state.player.x), z: Math.round(state.player.z), onFoot: state.player.onFoot },
-        police: policeNear(state).count,
-        phase, lastTarget, lastWp,
-        walkIndex: stealWalker.index, walkLen: stealWalker.len, walkKey: stealWalker.targetKey,
-        lastInput, driveWp: waypoints[wpIndex] || null, wpIndex,
-        speed: Math.round(state.player.speed * 10) / 10,
+        input: { move: { fwd: 0.4, strafe: sidestepDir, sprint: false }, drive: { steer: 0, accel: 0, brake: false }, actions: 0, camYaw },
+        dist,
       };
-    },
-  };
+    }
+    if (dist < walkLastDist - 0.5) {
+      walkStuckTime = 0;
+      walkLastDist = dist;
+    } else {
+      walkStuckTime += dt;
+      if (walkStuckTime > 2.5) {
+        walkStuckTime = 0;
+        walkLastDist = dist;
+        sidestepTime = 1.5;
+        sidestepDir = -sidestepDir;
+      }
+    }
+    return {
+      input: { move: { fwd: dist > 1.2 ? 1 : 0, strafe: 0, sprint: dist > 12 }, drive: { steer: 0, accel: 0, brake: false }, actions: 0, camYaw },
+      dist,
+    };
+  }
+
+  function driveTo(tx, tz, dt) {
+    const p = world.player;
+    const car = world.cars.find((c) => c.id === p.carId);
+    const dx = tx - p.x;
+    const dz = tz - p.z;
+    const dist = Math.hypot(dx, dz);
+    const desired = Math.atan2(dx, dz);
+    const err = angleDiff(desired, p.heading);
+    // While driving, the camera sits behind the car: look along the heading.
+    camYaw = p.heading + Math.PI;
+    let steer = Math.max(-1, Math.min(1, err * 2.2));
+    let accel = 1;
+    let brake = false;
+    if (Math.abs(err) > 1.1) {
+      // Facing the wrong way: brake while moving, but creep forward once
+      // slow — steering authority grows with speed, so a stopped car can
+      // never turn around, and braking to a standstill deadlocks the driver.
+      if (car && Math.abs(car.speed) > 3) {
+        brake = true;
+        accel = 0;
+      }
+    }
+    if (reversing > 0) {
+      reversing -= dt;
+      return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer: -steer, accel: 0, brake: true }, actions: 0, camYaw }, dist };
+    }
+    if (car && Math.abs(car.speed) < 0.6) {
+      // Stuck against something (or spun around): back out, whether or not
+      // the throttle is down — waiting for accel first never fires when the
+      // driver is braking into a wall.
+      stuckTime += dt;
+      if (stuckTime > 2) {
+        stuckTime = 0;
+        reversing = 1.2;
+      }
+    } else {
+      stuckTime = 0;
+    }
+    return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer, accel, brake }, actions: 0, camYaw }, dist };
+  }
+
+  function nearestParkedCar() {
+    let best = null;
+    let bestD = Infinity;
+    for (const car of world.cars) {
+      if (car.type !== 'parked' || car.wrecked) continue;
+      const d = Math.hypot(car.x - world.player.x, car.z - world.player.z);
+      if (d < bestD) { bestD = d; best = car; }
+    }
+    return { car: best, dist: bestD };
+  }
+
+  function nearestPed() {
+    let best = null;
+    let bestD = Infinity;
+    for (const ped of world.peds) {
+      if (ped.state === 'down') continue;
+      const d = Math.hypot(ped.x - world.player.x, ped.z - world.player.z);
+      if (d < bestD) { bestD = d; best = ped; }
+    }
+    return { ped: best, dist: bestD };
+  }
+
+  function update(dt) {
+    phaseTime += dt;
+    const p = world.player;
+
+    if (phase === 'start') {
+      if (shotName === 'start') {
+        // The title screen over the city: let it render, then capture.
+        status = 'title screen';
+        if (phaseTime > 1.5) done = true;
+        return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer: 0, accel: 0, brake: false }, actions: 0, camYaw }, done, status };
+      }
+      // Every other shot starts the game.
+      if (world.state === 'title') {
+        return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer: 0, accel: 0, brake: false }, actions: ACTION_CONFIRM, camYaw }, done, status: 'starting game' };
+      }
+      // The wanted shot steals straight away: chasing a pedestrian first
+      // drags the player far from the parked cars and the 30 s findCar
+      // budget runs out before the walk back. The steal alone raises 1 star,
+      // and the driveWanted phase re-raises heat with a shot if the star
+      // decays before the chase forms.
+      phase = 'findCar';
+      phaseTime = 0;
+    }
+
+    if (phase === 'findPed') {
+      const { ped, dist } = nearestPed();
+      if (!ped) { phase = 'findCar'; phaseTime = 0; return update(dt); }
+      if (dist < 2.0) {
+        phase = 'punch';
+        phaseTime = 0;
+        return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer: 0, accel: 0, brake: false }, actions: ACTION_PUNCH, camYaw }, done, status: 'punching a pedestrian (crime: +1 star)' };
+      }
+      const { input } = walkTo(ped.x, ped.z, dt);
+      status = `walking to a pedestrian (${dist.toFixed(0)} m)`;
+      if (phaseTime > 25) { phase = 'findCar'; phaseTime = 0; }
+      return { input, done, status };
+    }
+
+    if (phase === 'punch') {
+      if (phaseTime > 0.6) { phase = 'findCar'; phaseTime = 0; }
+      return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer: 0, accel: 0, brake: false }, actions: 0, camYaw }, done, status: 'punch landed' };
+    }
+
+    if (phase === 'findCar') {
+      const { car, dist } = nearestParkedCar();
+      if (!car) { status = 'no parked car found'; done = true; return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer: 0, accel: 0, brake: false }, actions: 0, camYaw }, done, status }; }
+      if (dist < 3.0) {
+        phase = 'enterCar';
+        phaseTime = 0;
+        return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer: 0, accel: 0, brake: false }, actions: ACTION_INTERACT, camYaw }, done, status: 'stealing the car' };
+      }
+      const { input } = walkTo(car.x, car.z, dt);
+      status = `walking to a parked car (${dist.toFixed(0)} m)`;
+      if (phaseTime > 30) { status = 'could not reach a car'; done = true; }
+      return { input, done, status };
+    }
+
+    if (phase === 'enterCar') {
+      if (!p.onFoot) {
+        if (shotName === 'drive') {
+          route = planRoute(p.x, p.z, 84, -126);
+          routeIndex = 0;
+          phase = 'driveRoute';
+        } else if (shotName === 'wanted') {
+          route = planRoute(p.x, p.z, -84, 84);
+          routeIndex = 0;
+          phase = 'driveWanted';
+        } else if (shotName === 'mission') {
+          const target = MISSIONS[0].stages[1].target;
+          route = planRoute(p.x, p.z, target[0], target[1]);
+          routeIndex = 0;
+          phase = 'driveMission';
+        }
+        phaseTime = 0;
+        return update(dt);
+      }
+      if (phaseTime > 2) { phase = 'findCar'; phaseTime = 0; }
+      return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer: 0, accel: 0, brake: false }, actions: ACTION_INTERACT, camYaw }, done, status: 'entering the car' };
+    }
+
+    if (phase === 'driveRoute' || phase === 'driveWanted' || phase === 'driveMission') {
+      if (p.onFoot) {
+        // The car was wrecked under the driver: go steal another one instead
+        // of standing still with drive input until the phase times out.
+        phase = 'findCar';
+        phaseTime = 0;
+        return update(dt);
+      }
+      const target = route[routeIndex];
+      const { input, dist } = driveTo(target[0], target[1], dt);
+      if (dist < 8) {
+        routeIndex += 1;
+        if (routeIndex >= route.length) {
+          if (phase === 'driveMission') {
+            status = 'reached the Docks';
+            done = true;
+          } else {
+            route = planRoute(p.x, p.z, p.x + (world.rng() - 0.5) * 200, p.z + (world.rng() - 0.5) * 200);
+            routeIndex = 0;
+          }
+        }
+      }
+      if (phase === 'driveRoute') {
+        status = `driving (${Math.round(Math.abs(world.cars.find((c) => c.id === p.carId)?.speed || 0) * 3.6)} km/h)`;
+        const car = world.cars.find((c) => c.id === p.carId);
+        if (car && Math.abs(car.speed) > 30 && phaseTime > 4) {
+          done = true;
+          status = `driving at ${Math.round(Math.abs(car.speed) * 3.6)} km/h`;
+        }
+        if (phaseTime > 20) done = true;
+      } else if (phase === 'driveWanted') {
+        if (world.wanted === 0) {
+          // The star decayed before the chase formed: fire a shot to raise
+          // heat again. One shot per frame at most — the sim's cooldown and
+          // the next frame's wanted > 0 stop the firing.
+          input.actions = ACTION_SHOOT;
+        }
+        const chaser = world.police.find((c) => !c.wrecked && c.state === 'chase');
+        const chaserDist = chaser ? Math.hypot(chaser.x - p.x, chaser.z - p.z) : Infinity;
+        status = `wanted ${world.wanted} star${world.wanted === 1 ? '' : 's'} — chaser ${chaserDist === Infinity ? '—' : chaserDist.toFixed(0) + ' m'}`;
+        // One star is enough for the shot: the punch that would make it two
+        // often never lands (the pedestrian flees through the blocks), and
+        // by the time a 2-star chase forms the star has decayed. A 1-star
+        // chase with a cruiser closing in is the scene the shot needs.
+        if (world.wanted >= 1 && chaser && chaserDist < 28 && phaseTime > 5) {
+          done = true;
+          status = `wanted ${world.wanted} star${world.wanted === 1 ? '' : 's'}, police ${chaserDist.toFixed(0)} m behind`;
+        }
+        if (phaseTime > 30) done = true;
+      } else if (phase === 'driveMission') {
+        status = `driving to the Docks (${dist.toFixed(0)} m)`;
+        if (world.missionIndex >= 1) {
+          done = true;
+          status = 'First Wheels complete — $300';
+        }
+        if (phaseTime > 60) done = true;
+      }
+      return { input, done, status };
+    }
+
+    return { input: { move: { fwd: 0, strafe: 0, sprint: false }, drive: { steer: 0, accel: 0, brake: false }, actions: 0, camYaw }, done, status };
+  }
+
+  return { update, get done() { return done; }, get status() { return status; } };
 }

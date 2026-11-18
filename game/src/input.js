@@ -26,6 +26,10 @@ export function createInput(canvas, onOrbit) {
   let dragging = false;
   let lastX = 0;
   let lastY = 0;
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let dragStartTime = 0;
+  let dragMoved = false;
 
   window.addEventListener('keydown', (event) => {
     if (event.repeat) {
@@ -47,8 +51,14 @@ export function createInput(canvas, onOrbit) {
 
   canvas.addEventListener('pointerdown', (event) => {
     if (event.button === 0) {
-      actions |= ACTION_SHOOT;
+      // A press starts a possible drag (orbit); it only becomes a shot if
+      // the pointer is released quickly without moving — so orbiting the
+      // camera never fires the pistol by accident.
       dragging = true;
+      dragStartX = event.clientX;
+      dragStartY = event.clientY;
+      dragStartTime = performance.now();
+      dragMoved = false;
       lastX = event.clientX;
       lastY = event.clientY;
     }
@@ -59,9 +69,15 @@ export function createInput(canvas, onOrbit) {
     const dy = event.clientY - lastY;
     lastX = event.clientX;
     lastY = event.clientY;
+    if (Math.abs(event.clientX - dragStartX) + Math.abs(event.clientY - dragStartY) > 6) dragMoved = true;
     if (onOrbit) onOrbit(dx, dy);
   });
-  window.addEventListener('pointerup', () => { dragging = false; });
+  window.addEventListener('pointerup', (event) => {
+    if (dragging && event.button === 0 && !dragMoved && performance.now() - dragStartTime < 300) {
+      actions |= ACTION_SHOOT;
+    }
+    dragging = false;
+  });
   canvas.addEventListener('wheel', (event) => {
     event.preventDefault();
     if (onOrbit) onOrbit(0, 0, event.deltaY);
@@ -70,7 +86,7 @@ export function createInput(canvas, onOrbit) {
   return {
     /** Forward/back and strafe for on-foot movement. */
     move() {
-      const fwd = (FWD.size && [...FWD].some((c) => held.has(c)) ? 1 : 0) - ([...BACK].some((c) => held.has(c)) ? 1 : 0);
+      const fwd = ([...FWD].some((c) => held.has(c)) ? 1 : 0) - ([...BACK].some((c) => held.has(c)) ? 1 : 0);
       const strafe = ([...RIGHT].some((c) => held.has(c)) ? 1 : 0) - ([...LEFT].some((c) => held.has(c)) ? 1 : 0);
       return { fwd, strafe, sprint: [...SPRINT].some((c) => held.has(c)) };
     },
