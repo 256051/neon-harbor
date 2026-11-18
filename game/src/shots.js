@@ -119,7 +119,7 @@ export function createShotDriver(world, shotName) {
     };
   }
 
-  function driveTo(tx, tz, dt) {
+  function driveTo(tx, tz, dt, speedCap = 38) {
     const p = world.player;
     const car = world.cars.find((c) => c.id === p.carId);
     const dx = tx - p.x;
@@ -132,14 +132,19 @@ export function createShotDriver(world, shotName) {
     let steer = Math.max(-1, Math.min(1, err * 2.2));
     let accel = 1;
     let brake = false;
-    if (Math.abs(err) > 1.1) {
-      // Facing the wrong way: brake while moving, but creep forward once
-      // slow — steering authority grows with speed, so a stopped car can
-      // never turn around, and braking to a standstill deadlocks the driver.
-      if (car && Math.abs(car.speed) > 3) {
-        brake = true;
-        accel = 0;
-      }
+    // Cornering: take sharp turns slowly. At full speed a 90-degree turn
+    // slams the car into the building on the corner, and a few hard hits
+    // wreck it — the mission run died exactly this way. Cap the speed by
+    // the heading error: crawl through a U-turn, ease through a bend, full
+    // speed on a straight. Facing the wrong way (|err| > 1.1) brakes while
+    // moving but creeps forward once slow — steering authority grows with
+    // speed, so a stopped car can never turn around, and braking to a
+    // standstill deadlocks the driver.
+    const cornerCap = Math.abs(err) > 1.1 ? 6 : Math.abs(err) > 0.5 ? 14 : 38;
+    const cap = Math.min(speedCap, cornerCap);
+    if (car && Math.abs(car.speed) > cap) {
+      brake = true;
+      accel = 0;
     }
     if (reversing > 0) {
       reversing -= dt;
@@ -235,7 +240,7 @@ export function createShotDriver(world, shotName) {
       }
       const { input } = walkTo(car.x, car.z, dt);
       status = `walking to a parked car (${dist.toFixed(0)} m)`;
-      if (phaseTime > 30) { status = 'could not reach a car'; done = true; }
+      if (phaseTime > 45) { status = 'could not reach a car'; done = true; }
       return { input, done, status };
     }
 
@@ -270,8 +275,30 @@ export function createShotDriver(world, shotName) {
         phaseTime = 0;
         return update(dt);
       }
-      const target = route[routeIndex];
-      const { input, dist } = driveTo(target[0], target[1], dt);
+      // The wanted shot's chase: the cruiser (37) barely outruns the
+      // player's car (38), so at full throttle it never closes in. Cruise
+      // at 16 and it catches up in seconds. Once it is near, turn and face
+      // it — the chase camera sits behind the car, so a cruiser closing in
+      // from behind is behind the camera and never in frame; head-on it is.
+      let target = route[routeIndex];
+      let speedCap = 38;
+      let chaser = null;
+      let chaserDist = Infinity;
+      if (phase === 'driveWanted') {
+        chaser = world.police.find((c) => !c.wrecked && (c.state === 'chase' || c.state === 'search'));
+        if (chaser) {
+          chaserDist = Math.hypot(chaser.x - p.x, chaser.z - p.z);
+          speedCap = 16;
+          // Face it from the moment it exists, not only when it is close:
+          // the chase forms in about a second at the capped speed, and the
+          // old 5 s settle gate let the cruiser ram the player repeatedly
+          // before the shot could complete (HP 60 in the last take). Facing
+          // it at once keeps the cruiser head-on in frame and the completion
+          // fires before it can reach ram range.
+          target = [chaser.x, chaser.z];
+        }
+      }
+      const { input, dist } = driveTo(target[0], target[1], dt, speedCap);
       if (dist < 8) {
         routeIndex += 1;
         if (routeIndex >= route.length) {
@@ -299,16 +326,25 @@ export function createShotDriver(world, shotName) {
           // the next frame's wanted > 0 stop the firing.
           input.actions = ACTION_SHOOT;
         }
-        const chaser = world.police.find((c) => !c.wrecked && c.state === 'chase');
-        const chaserDist = chaser ? Math.hypot(chaser.x - p.x, chaser.z - p.z) : Infinity;
-        status = `wanted ${world.wanted} star${world.wanted === 1 ? '' : 's'} — chaser ${chaserDist === Infinity ? '—' : chaserDist.toFixed(0) + ' m'}`;
+        // The cruiser drives straight at the player, so it often closes
+        // across a block and sits hidden behind a building while the
+        // distance reads 30 m. Require it to be roughly in front of the
+        // car (within the camera's view) as well as close — on the same
+        // street ahead, not across a block to the side.
+        const bearing = chaser ? Math.atan2(chaser.x - p.x, chaser.z - p.z) : 0;
+        const align = chaser ? Math.abs(angleDiff(bearing, p.heading)) : Infinity;
+        status = `wanted ${world.wanted} star${world.wanted === 1 ? '' : 's'} — chaser ${chaserDist === Infinity ? '—' : chaserDist.toFixed(0) + ' m'} align ${(align * 57.3).toFixed(0)}°`;
         // One star is enough for the shot: the punch that would make it two
         // often never lands (the pedestrian flees through the blocks), and
         // by the time a 2-star chase forms the star has decayed. A 1-star
         // chase with a cruiser closing in is the scene the shot needs.
-        if (world.wanted >= 1 && chaser && chaserDist < 28 && phaseTime > 5) {
+        // Complete early (40 m, not 20): headless runs at ~2 fps, so half a
+        // sim-second passes between this frame and the capture — at the
+        // head-on closing speed the cruiser would be on top of the player
+        // by then. At 40 m it lands a few metres out, head-on in frame.
+        if (world.wanted >= 1 && chaser && chaserDist < 40 && align < 0.5 && phaseTime > 1) {
           done = true;
-          status = `wanted ${world.wanted} star${world.wanted === 1 ? '' : 's'}, police ${chaserDist.toFixed(0)} m behind`;
+          status = `wanted ${world.wanted} star${world.wanted === 1 ? '' : 's'}, police ${chaserDist.toFixed(0)} m ahead`;
         }
         if (phaseTime > 30) done = true;
       } else if (phase === 'driveMission') {

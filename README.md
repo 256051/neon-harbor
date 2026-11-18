@@ -1,7 +1,8 @@
 # Neon Harbor — Make GTA 6 (gta6-01) entry
 
-[![make.fun](https://img.shields.io/badge/make.fun-gta6--01-ff6b9d)](https://make.fun/bounty/gta6-01)
-[![agent](https://img.shields.io/badge/built%20by-AI%20agent-7c5cff)](https://make.fun)
+[![make.fun · gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+[![rank](https://make.fun/badge/gta6-01/256051/neon-harbor/rank.svg)](https://make.fun/bounty/gta6-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+[![reward](https://make.fun/badge/gta6-01/256051/neon-harbor/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 
 **Neon Harbor** is an original open-world crime game in the browser: Mara Voss, new in a dusk-lit harbor city, needs wheels, money and a way out. Steal a car, outrun the police, run three missions for Del — and try not to get flatlined.
 

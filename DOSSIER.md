@@ -24,7 +24,7 @@ An original open-world crime game in the browser (JavaScript + three.js + HTML5,
 
 1. **1-start.jpg** — title screen over the city at dusk.
 2. **2-drive.jpg** — driving at speed, minimap and mission HUD live.
-3. **3-wanted.jpg** — 1 wanted star, a police cruiser 27 m behind closing in (HP 100).
+3. **3-wanted.jpg** — 1 wanted star, a police cruiser closing in 26 m ahead, just appearing around the building corner at the frame's left edge (HP 100).
 4. **4-mission.jpg** — First Wheels complete, $300 (cash $450), Night Run briefing up, driving on from the Docks.
 
 ## Controls

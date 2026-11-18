@@ -241,7 +241,7 @@ export function createHud(canvas, world) {
       if (world.hasSave) {
         drawTextBlock('Press C to continue your saved game', cx, cy + 100, 16, '#ffd23f', 'center', 'normal');
       }
-      drawTextBlock('Original work — no real city, no real cars, no Rockstar', cx, canvas.height - 24, 12, 'rgba(255,255,255,0.5)', 'center', 'normal');
+      drawTextBlock('Original work — no real city, no real cars, no brands', cx, canvas.height - 24, 12, 'rgba(255,255,255,0.5)', 'center', 'normal');
       return;
     }
 
