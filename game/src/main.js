@@ -1,258 +1,254 @@
-// Neon Harbor — the game entry. Wires the simulation (world.js), the
-// renderer (render.js), the HUD (hud.js), input and sound together and runs
-// the fixed-timestep loop. Switches, all read from the URL:
-//   ?seed=1          world seed (default 1)
-//   ?shot=start|drive|wanted|mission   screenshot mode: the autopilot in
-//                    shots.js plays, and window.__shotReady / __shotInfo
-//                    report when the scene is ready to capture
-//   ?bench           benchmark mode: live stats in #bench-overlay and in
-//                    window.__stats()
-//   ?q=low|medium|high   starting quality tier (default high)
-import { createWorld, stepWorld, startGame, pauseGame, resumeGame, restartGame, missionStageDef, readSave, loadSave, writeSave, getSave,
-  EVENT_START, EVENT_CRASH, EVENT_MONEY, EVENT_WANTED, EVENT_PUNCH, EVENT_SHOOT, EVENT_SHOT_HIT, EVENT_SHOT_MISS,
-  EVENT_POLICE_RAM, EVENT_HORN, EVENT_MISSION, EVENT_WIN, EVENT_LOSE, EVENT_PICKUP, EVENT_STEP } from './world.js';
-import { createRenderer } from './render.js';
-import { createHud } from './hud.js';
-import { createInput, ACTION_CONFIRM, ACTION_PAUSE, ACTION_INTERACT, ACTION_PUNCH, ACTION_SHOOT, ACTION_MUTE } from './input.js';
-import { createSound } from './sound.js';
-import { createShotDriver } from './shots.js';
+// Neon Harbor — the game loop. Wires input, world, render, sound and HUD
+// together, runs the title / playing / paused / dead / complete state machine,
+// and handles the ?seed=, ?bench and ?shot= switches plus save and load.
 
-const params = new URLSearchParams(location.search);
-const seed = Number(params.get('seed') || 1) || 1;
+import { World } from './world.js';
+import { Renderer } from './render.js';
+import { Input } from './input.js';
+import { Sound } from './sound.js';
+import { Hud } from './hud.js';
+import { createPilot } from './shots.js';
+import { seedFromString } from './random.js';
+import { CFG } from './config.js';
+
+const params = new URLSearchParams(window.location.search);
+const seedText = params.get('seed') || 'neon-harbor-1';
+const seed = seedFromString(seedText);
 const shotName = params.get('shot');
 const benchMode = params.has('bench');
-const qualityParam = params.get('q') || 'high';
+const SAVE_KEY = 'neon-harbor-save-v1';
 
-const gameCanvas = document.getElementById('game-canvas');
-const hudCanvas = document.getElementById('hud-canvas');
-const benchOverlay = document.getElementById('bench-overlay');
+const canvas = document.getElementById('game');
+const world = new World(seed);
+const renderer = new Renderer(canvas, world);
+const input = new Input(canvas);
+const sound = new Sound();
+const hud = new Hud(world);
+const pilot = shotName ? createPilot(shotName, world, input) : null;
 
-const world = createWorld(seed);
-world.hasSave = !!readSave();
-const renderer = createRenderer(gameCanvas, world, { quality: qualityParam, autoQuality: !shotName && !benchMode });
-const hud = createHud(hudCanvas, world);
-const sound = createSound();
+let quality = 'high';
+let autoQuality = true;
+let frameTimes = [];
+let lastFpsCheck = performance.now();
+let paused = false;
+let shotDone = false;
+let simTime = 0;
 
-let camYaw = 0;
-let camPitch = 0.32;
-let camDist = 10.5;
-const input = createInput(gameCanvas, (dx, dy, wheel) => {
-  camYaw -= dx * 0.005;
-  camPitch = Math.max(0.08, Math.min(0.9, camPitch + dy * 0.003));
-  if (wheel) camDist = Math.max(6, Math.min(16, camDist + wheel * 0.01));
-});
-
-// --- Shot mode: the autopilot plays and reports readiness. ------------------
-let shotDriver = null;
-if (shotName) {
-  shotDriver = createShotDriver(world, shotName);
-  window.__shotReady = false;
-  window.__shotInfo = null;
-}
-
-// --- Bench mode: show the overlay, count frames and steps. ------------------
-const bench = { frames: 0, steps: 0, startTime: performance.now(), fps: 0 };
-if (benchMode) {
-  benchOverlay.style.display = 'block';
-}
-window.__stats = () => ({
-  fps: bench.fps,
-  frames: bench.frames,
-  steps: bench.steps,
-  quality: renderer.getQuality(),
-  state: world.state,
-  wanted: world.wanted,
-  cash: world.player.cash,
-  missionIndex: world.missionIndex,
-  missionStage: world.missionStage,
-});
-
-// --- Sound: unlock on the first gesture, as browsers require. ----------------
-let soundUnlocked = false;
-function unlockSound() {
-  if (soundUnlocked) return;
-  soundUnlocked = true;
-  sound.init();
-  sound.startMusic();
-}
-window.addEventListener('keydown', unlockSound, { once: true });
-window.addEventListener('pointerdown', unlockSound, { once: true });
-
-// --- Events from the simulation become sound and toasts. ---------------------
-let lastToast = '';
-let sirenTimer = 0;
-let engineTimer = 0;
-function handleEvents(events, dt) {
-  if (events & EVENT_START) sound.click();
-  if (events & EVENT_CRASH) sound.crash();
-  if (events & EVENT_MONEY) sound.pickup();
-  if (events & EVENT_WANTED) sound.wanted();
-  if (events & EVENT_PUNCH) sound.punch();
-  if (events & EVENT_SHOOT) sound.shoot();
-  if (events & EVENT_SHOT_HIT) sound.click();
-  if (events & EVENT_SHOT_MISS) { /* a miss is silent */ }
-  if (events & EVENT_POLICE_RAM) sound.crash();
-  if (events & EVENT_HORN) sound.horn();
-  if (events & EVENT_MISSION) sound.mission();
-  if (events & EVENT_WIN) sound.win();
-  if (events & EVENT_LOSE) sound.fail();
-  if (events & EVENT_PICKUP) sound.pickup();
-  if (events & EVENT_STEP) sound.step();
-  if (world.missionToast && world.missionToast !== lastToast) {
-    lastToast = world.missionToast;
-    hud.showToast(world.missionToast, 5);
-  }
-  // Siren sting while chased, engine hum while driving.
-  sirenTimer -= dt;
-  if (world.wanted > 0 && world.police.some((c) => !c.wrecked && c.state === 'chase') && sirenTimer <= 0) {
-    sirenTimer = 2.0;
-    sound.siren();
-  }
-  engineTimer -= dt;
-  if (!world.player.onFoot && Math.abs(world.player.speed) > 5 && engineTimer <= 0) {
-    engineTimer = 0.35;
-    sound.engine();
+// Save / load: best money and mission progress, nothing else.
+function loadSave() {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (typeof data.bestMoney === 'number') world.bestMoney = data.bestMoney;
+    if (typeof data.money === 'number') world.money = data.money;
+  } catch (e) {
+    // A corrupt save is ignored; the game starts fresh.
   }
 }
 
-// --- Mission beacon: point at the current target, if it has one. -------------
-function updateBeacon() {
-  if (world.state !== 'playing') { renderer.setBeacon(0, 0, false); return; }
-  const stage = missionStageDef(world);
-  if (stage && stage.target) renderer.setBeacon(stage.target[0], stage.target[1], true);
-  else renderer.setBeacon(0, 0, false);
+function saveGame() {
+  try {
+    localStorage.setItem(SAVE_KEY, JSON.stringify({
+      bestMoney: world.bestMoney,
+      money: world.money,
+      mission: world.missionIndex,
+    }));
+  } catch (e) {
+    // Storage may be unavailable headless; the game plays on regardless.
+  }
 }
 
-// --- The loop: fixed 1/60 s simulation steps, render every frame. ------------
+function startGame() {
+  if (world.state === 'playing') return;
+  world.state = 'playing';
+  world.startMission(0);
+  hud.setTitle(false);
+  hud.setDead(false);
+  hud.setComplete(false);
+  hud.setPaused(false);
+  sound.ensure();
+  sound.click();
+}
+
+function restartGame() {
+  const keepBest = world.bestMoney;
+  const fresh = new World(seed);
+  // Swap the fresh world's state in place so render/hud keep their references.
+  for (const key of Object.keys(fresh)) world[key] = fresh[key];
+  world.bestMoney = Math.max(keepBest, world.bestMoney);
+  world.state = 'playing';
+  world.startMission(0);
+  hud.setTitle(false);
+  hud.setDead(false);
+  hud.setComplete(false);
+  hud.setPaused(false);
+  sound.click();
+}
+
+function togglePause() {
+  if (world.state !== 'playing' && world.state !== 'paused') return;
+  paused = !paused;
+  world.state = paused ? 'paused' : 'playing';
+  hud.setPaused(paused);
+  sound.click();
+}
+
+// Fixed-step simulation so the game plays the same at any frame rate.
 const STEP = 1 / 60;
-let lastTime = performance.now();
 let accumulator = 0;
-let firstFrame = true;
+let lastNow = performance.now();
+
+function stepWorld(dt) {
+  // Camera: drag with the mouse to orbit. While driving, ease behind the car;
+  // on foot the camera stays where the player left it so walking stays true.
+  if (input.mouseDown && Math.abs(input.lookDX) > 0) {
+    world.cameraYaw += input.lookDX * 0.005;
+  } else if (world.state === 'playing' && world.player.car) {
+    const p = world.player;
+    let diff = p.angle - world.cameraYaw;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    world.cameraYaw += diff * Math.min(1, dt * 1.6);
+  }
+  world.update(dt, input);
+  for (const ev of world.events) {
+    if (ev === 'shot') sound.shot();
+    else if (ev === 'punch') sound.punch();
+    else if (ev === 'crash') sound.crash();
+    else if (ev === 'steal') sound.steal();
+    else if (ev === 'missionDone') {
+      sound.missionDone();
+      saveGame();
+    }
+  }
+  if (world.state === 'dead') {
+    hud.setDead(true, world.money);
+    saveGame();
+  } else if (world.state === 'complete') {
+    hud.setComplete(true, world.money);
+    saveGame();
+  }
+  const speedNorm = world.player.car
+    ? world.player.car.speed / CFG.carMaxSpeed
+    : world.player.speed / CFG.runSpeed;
+  sound.update(speedNorm, world.stars);
+}
 
 function frame(now) {
   requestAnimationFrame(frame);
-  // The delta is capped at 0.5 s (30 fixed steps): on a slow machine — a
-  // software renderer headless, say — the simulation still keeps up with
-  // real time instead of falling behind a frame at a time.
-  const dt = Math.min(0.5, (now - lastTime) / 1000);
-  lastTime = now;
-  bench.frames += 1;
+  // Wall-clock delta, not the rAF timestamp: headless timestamps can be
+  // quantized, which would starve the fixed-step simulation.
+  const wallNow = performance.now();
+  let dt = Math.min(0.12, (wallNow - lastNow) / 1000);
+  lastNow = wallNow;
 
-  const actions = input.takeActions();
-  if (shotDriver) {
-    // Shot mode: the driver supplies the input; the player never touches it.
-    const { input: shotInput, done, status } = shotDriver.update(dt);
-    if ((shotInput.actions & ACTION_CONFIRM) && (world.state === 'title' || world.state === 'dead' || world.state === 'win')) {
-      // The driver's start signal: title -> start, dead/win -> restart.
-      // stepWorld never sees CONFIRM, so main.js must act on it here —
-      // without this the autopilot waits on the title screen forever.
-      if (world.state === 'title') startGame(world);
-      else restartGame(world);
+  // Auto-quality, always on: a slow frame rate steps the tier down.
+  frameTimes.push(dt);
+  if (wallNow - lastFpsCheck > 2000) {
+    const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+    frameTimes = [];
+    lastFpsCheck = wallNow;
+    if (autoQuality && avg > 0.045 && quality !== 'low') {
+      quality = quality === 'high' ? 'medium' : 'low';
+      renderer.setQuality(quality);
     }
-    camYaw = shotInput.camYaw;
-    renderer.setCameraYaw(camYaw);
-    accumulator += dt;
-    let steps = 0;
-    while (accumulator >= STEP && steps < 30) {
-      const events = stepWorld(world, shotInput, STEP);
-      handleEvents(events, STEP);
-      accumulator -= STEP;
-      steps += 1;
-      bench.steps += 1;
+    if (benchMode) {
+      const el = document.getElementById('bench');
+      el.style.display = 'block';
+      el.textContent = `bench seed=${seedText} fps=${Math.round(1 / avg)} draw=${renderer.renderer.info.render.calls} tris=${renderer.renderer.info.render.triangles}`;
     }
-    updateBeacon();
-    renderer.update(dt, null);
-    hud.draw(world.state, dt, camYaw);
-    if (done && !window.__shotReady) {
-      // One more rendered frame, then report: the screenshot catches the
-      // finished scene (mission toast, wanted stars, speed) as it stands.
-      window.__shotInfo = {
-        success: true,
-        shot: shotName,
-        status,
-        state: world.state,
-        wanted: world.wanted,
-        cash: world.player.cash,
-        missionIndex: world.missionIndex,
-        missionStage: world.missionStage,
-        speedKmh: Math.round(Math.abs(world.player.speed) * 3.6),
-      };
-      window.__shotReady = true;
-    }
-  } else {
-    // Normal play: keyboard state transitions, then the simulation.
-    if (actions & ACTION_MUTE) {
-      sound.setMuted(!sound.isMuted());
-      hud.showToast(sound.isMuted() ? 'Muted — press M to unmute' : 'Sound on', 2);
-    }
-    if (world.state === 'title' && (actions & ACTION_CONFIRM)) {
-      unlockSound();
-      startGame(world);
-    } else if (world.state === 'playing' && (actions & ACTION_PAUSE)) {
-      pauseGame(world);
-      writeSave(world);
-    } else if (world.state === 'paused' && (actions & ACTION_PAUSE)) {
-      resumeGame(world);
-    } else if ((world.state === 'dead' || world.state === 'win') && (actions & ACTION_CONFIRM)) {
-      unlockSound();
-      restartGame(world);
-    }
+  }
 
-    const simInput = {
-      move: input.move(),
-      drive: input.drive(),
-      actions: world.state === 'playing' ? actions : 0,
-      camYaw,
-    };
-    accumulator += dt;
-    let steps = 0;
-    while (accumulator >= STEP && steps < 30) {
-      if (world.state === 'playing') {
-        const events = stepWorld(world, simInput, STEP);
-        handleEvents(events, STEP);
-        bench.steps += 1;
+  // Global keys.
+  if (input.wasPressed('p') || input.wasPressed('escape')) togglePause();
+  if (input.wasPressed('m')) {
+    sound.setMuted(!sound.muted);
+    sound.ensure();
+  }
+  if (world.state === 'title' && (input.wasPressed(' ') || input.wasPressed('enter') || input.clicked)) {
+    startGame();
+  } else if ((world.state === 'dead' || world.state === 'complete') && (input.wasPressed(' ') || input.wasPressed('enter') || input.clicked)) {
+    restartGame();
+  }
+  if (world.state === 'title' && input.wasPressed('q')) {
+    const sel = document.getElementById('quality-select');
+    quality = sel.value;
+    renderer.setQuality(quality);
+  }
+
+  if (shotName && pilot && !shotDone) {
+    // Shot mode: burn through simulation fast, then signal the screenshot.
+    // The start shot keeps the title screen; every other shot plays the game.
+    if (world.state === 'title' && shotName !== 'start') startGame();
+    let guard = 0;
+    while (guard < 240) {
+      const status = pilot.update(STEP);
+      stepWorld(STEP);
+      input.clearPresses();
+      simTime += STEP;
+      guard++;
+      if (status === 'done') {
+        shotDone = true;
+        if (pilot.frameChase) renderer.frameChase();
+        hud.update();
+        renderer.render(STEP);
+        window.__shotReady = true;
+        window.__shotInfo = JSON.stringify(world.debug());
+        break;
       }
-      accumulator -= STEP;
-      steps += 1;
+      if (world.state === 'dead' || world.state === 'complete') {
+        shotDone = true;
+        window.__shotReady = true;
+        window.__shotInfo = JSON.stringify(world.debug());
+        break;
+      }
     }
-    updateBeacon();
-    renderer.setCameraYaw(camYaw);
-    renderer.update(dt, { orbit: null });
-    hud.draw(world.state, dt, camYaw);
+    input.endFrame();
+    return;
   }
 
-  if (benchMode) {
-    const elapsed = (performance.now() - bench.startTime) / 1000;
-    bench.fps = elapsed > 0 ? Math.round(bench.frames / elapsed) : 0;
-    benchOverlay.textContent = `bench — ${bench.fps} fps · ${bench.frames} frames · ${bench.steps} steps · ${renderer.getQuality()} quality · ${world.state}`;
+  if (shotDone) {
+    // Freeze the finished shot: keep rendering the same frame so the
+    // screenshot cannot drift while the page waits to be captured.
+    hud.update();
+    renderer.renderer.render(renderer.scene, renderer.camera);
+    input.endFrame();
+    return;
   }
 
-  if (firstFrame) {
-    firstFrame = false;
-    window.__ready = true;
+  if (!paused && world.state === 'playing') {
+    accumulator += dt;
+    let steps = 0;
+    while (accumulator >= STEP && steps < 8) {
+      stepWorld(STEP);
+      // One-frame presses (E, click) must not repeat across the steps of
+      // a single rendered frame, or one E press steals and re-steals.
+      input.clearPresses();
+      accumulator -= STEP;
+      steps++;
+    }
+    if (steps === 8) accumulator = 0; // drop backlog after a hitch
   }
+
+  // Quality selector on the title screen.
+  const sel = document.getElementById('quality-select');
+  if (sel && sel.value !== quality && world.state === 'title') {
+    quality = sel.value;
+    renderer.setQuality(quality);
+  }
+
+  hud.update();
+  renderer.render(dt);
+  input.endFrame();
 }
 
-// A saved game offers a continue: Space on the title screen starts fresh;
-// the save is loaded automatically when the player presses C. (Kept simple:
-// the title screen shows the hint when a save exists.)
-window.addEventListener('keydown', (event) => {
-  if (event.code === 'KeyC' && world.state === 'title') {
-    const save = readSave();
-    if (save) {
-      loadSave(world, save);
-      unlockSound();
-      startGame(world);
-      hud.showToast('Save loaded — welcome back to the harbor', 4);
-    }
-  }
-});
-
-window.__game = {
-  world, renderer, hud, input, sound,
-  get screen() { return world.state; },
-  get save() { return getSave(world); },
-  restart: () => restartGame(world),
-};
-
+// Boot.
+loadSave();
+hud.setTitle(true);
+if (benchMode) document.getElementById('bench').style.display = 'block';
+window.__game = world;
+window.__debug = () => world.debug();
+window.__shotReady = false;
+renderer.render(0.016);
 requestAnimationFrame(frame);

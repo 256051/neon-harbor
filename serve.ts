@@ -1,67 +1,45 @@
-// A tiny static server for game/ (Node 22, standard library only). It exists
-// so the entry can be played and tested locally with no build step:
-//   node serve.ts            -> http://localhost:8901
+// Neon Harbor — a tiny static file server for local testing only.
+// Serves the repository root on a local port; nothing here ships in the entry.
+//
+//   node serve.ts            -> http://localhost:8901/
 //   node serve.ts --port 8080
-// Only files under game/ are served, with the MIME types a browser game
-// needs; anything outside that directory is refused. This is a development
-// convenience, not a server for the internet.
-import { createReadStream, statSync } from 'node:fs';
+
 import { createServer } from 'node:http';
-import { extname, join, normalize, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { extname, join, normalize } from 'node:path';
 
-const root = resolve(fileURLToPath(new URL('./game', import.meta.url)));
-const args = process.argv.slice(2);
-const portIndex = args.indexOf('--port');
-const wanted = portIndex === -1 ? 8901 : Number(args[portIndex + 1]);
-const port = Number.isInteger(wanted) && wanted > 0 && wanted < 65536 ? wanted : 8901;
+const portIndex = process.argv.indexOf('--port');
+const port = portIndex >= 0 ? Number(process.argv[portIndex + 1]) : 8901;
 
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.png': 'image/png',
+const TYPES = {
+  '.html': 'text/html',
+  '.js': 'text/javascript',
+  '.mjs': 'text/javascript',
+  '.css': 'text/css',
+  '.json': 'application/json',
   '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-  '.txt': 'text/plain; charset=utf-8',
+  '.png': 'image/png',
 };
 
-createServer((request, response) => {
-  const url = new URL(request.url ?? '/', 'http://localhost');
-  let pathname;
+const server = createServer(async (req, res) => {
   try {
-    pathname = decodeURIComponent(url.pathname);
-  } catch {
-    response.writeHead(400).end('bad request');
-    return;
+    const urlPath = decodeURIComponent(new URL(req.url ?? '/', 'http://localhost').pathname);
+    let rel = normalize(urlPath).replace(/^[/\\]+/, '');
+    if (rel === '') rel = 'game/index.html';
+    const file = join(process.cwd(), rel);
+    if (!file.startsWith(process.cwd()) || !existsSync(file)) {
+      res.writeHead(404);
+      res.end('not found');
+      return;
+    }
+    const body = await readFile(file);
+    res.writeHead(200, { 'content-type': TYPES[extname(file)] ?? 'application/octet-stream' });
+    res.end(body);
+  } catch (e) {
+    res.writeHead(500);
+    res.end(String(e));
   }
-  if (pathname.endsWith('/')) pathname += 'index.html';
-  const file = resolve(join(root, normalize(pathname)));
-  if (file !== root && !file.startsWith(root + sep)) {
-    response.writeHead(403).end('forbidden');
-    return;
-  }
-  let size;
-  try {
-    const stats = statSync(file);
-    if (!stats.isFile()) throw new Error('not a file');
-    size = stats.size;
-  } catch {
-    response.writeHead(404).end('not found');
-    return;
-  }
-  response.writeHead(200, {
-    'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
-    'content-length': size,
-    'cache-control': 'no-store',
-  });
-  createReadStream(file).pipe(response);
-}).listen(port, '127.0.0.1', () => {
-  console.log(`game/ is on http://localhost:${port}`);
 });
+
+server.listen(port, () => console.log(`Neon Harbor test server: http://localhost:${port}/`));

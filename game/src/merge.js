@@ -1,90 +1,121 @@
-// Geometry merging, written for this game — the one helper the vendored
-// three.js utils used to provide, re-implemented here so the entry carries no
-// extra library file. It concatenates indexed geometries that share the same
-// attribute set (position / normal / uv on every shape this game builds).
-//
-// Groups: with useGroups, each input geometry becomes one group whose
-// materialIndex is its position in the list — the same rule three.js itself
-// uses, which is what the car bodies and the people rely on (body = group 0,
-// cabin = group 1; torso = 0, head = 1, arms = 2, 3).
-//
-// groupFn is the escape hatch for the buildings: a box carries six groups
-// (px, nx, py, ny, pz, nz) and the caller remaps them, so one merged city
-// mesh can have different materials for walls, roof tops and roof sides.
-// Without the remap, groups past the end of the material array are skipped
-// by the renderer and most of the city would simply not draw — which is why
-// the buildings call mergeGeometries with a remap instead of plain useGroups.
+// Neon Harbor — merge helper. Hundreds of static boxes (buildings, lamps, crates)
+// become one draw call instead of hundreds: every box is written into a single
+// BufferGeometry with a colour per vertex. Written from scratch for this game;
+// it does not use any geometry-utils library.
+
 import * as THREE from 'three';
 
-export function mergeGeometries(geometries, useGroups = false, groupFn = null) {
-  if (!geometries.length) return null;
-  const first = geometries[0];
-  const isIndexed = first.index !== null;
-  const attrNames = Object.keys(first.attributes);
+// One unit box, kept as the template every item is stamped from.
+const template = new THREE.BoxGeometry(1, 1, 1);
 
-  for (let i = 0; i < geometries.length; i += 1) {
-    const g = geometries[i];
-    if ((g.index !== null) !== isIndexed) {
-      console.error('mergeGeometries: all geometries must be indexed, or none');
-      return null;
+export function mergeBoxes(items) {
+  // items: [{ x, y, z, sx, sy, sz, color }] — color is a hex number like 0x8a6f4d.
+  const boxCount = items.length;
+  const vertsPerBox = template.attributes.position.count; // 24
+  const indexPerBox = template.index.count; // 36
+  const positions = new Float32Array(boxCount * vertsPerBox * 3);
+  const normals = new Float32Array(boxCount * vertsPerBox * 3);
+  const colors = new Float32Array(boxCount * vertsPerBox * 3);
+  const index = new Uint32Array(boxCount * indexPerBox);
+
+  const srcPos = template.attributes.position.array;
+  const srcNor = template.attributes.normal.array;
+  const srcIdx = template.index.array;
+  const tmpColor = new THREE.Color();
+
+  for (let b = 0; b < boxCount; b++) {
+    const item = items[b];
+    const hx = item.sx / 2;
+    const hy = item.sy / 2;
+    const hz = item.sz / 2;
+    tmpColor.setHex(item.color);
+    const vBase = b * vertsPerBox;
+    for (let v = 0; v < vertsPerBox; v++) {
+      const o = v * 3;
+      const vo = (vBase + v) * 3;
+      positions[vo] = item.x + srcPos[o] * item.sx;
+      positions[vo + 1] = item.y + srcPos[o + 1] * item.sy;
+      positions[vo + 2] = item.z + srcPos[o + 2] * item.sz;
+      normals[vo] = srcNor[o];
+      normals[vo + 1] = srcNor[o + 1];
+      normals[vo + 2] = srcNor[o + 2];
+      colors[vo] = tmpColor.r;
+      colors[vo + 1] = tmpColor.g;
+      colors[vo + 2] = tmpColor.b;
     }
-    const names = Object.keys(g.attributes);
-    if (names.length !== attrNames.length || !names.every((n) => attrNames.includes(n))) {
-      console.error('mergeGeometries: geometries must share the same attributes');
-      return null;
+    const iBase = b * indexPerBox;
+    for (let k = 0; k < indexPerBox; k++) {
+      index[iBase + k] = vBase + srcIdx[k];
     }
+    // Keep the half-extents out of the linter's way: they document the transform.
+    void hx;
+    void hy;
+    void hz;
   }
 
-  const merged = new THREE.BufferGeometry();
-
-  // Attributes: concatenate each attribute's array in order.
-  for (const name of attrNames) {
-    const itemSize = first.attributes[name].itemSize;
-    let total = 0;
-    for (const g of geometries) total += g.attributes[name].count;
-    const ArrayType = first.attributes[name].array.constructor;
-    const out = new ArrayType(total * itemSize);
-    let offset = 0;
-    for (const g of geometries) {
-      out.set(g.attributes[name].array, offset);
-      offset += g.attributes[name].array.length;
-    }
-    merged.setAttribute(name, new THREE.BufferAttribute(out, itemSize));
-  }
-
-  // Index: rebase every index by the vertex offset of its geometry.
-  let indexOffset = 0;
-  if (isIndexed) {
-    const mergedIndex = [];
-    for (const g of geometries) {
-      const idx = g.index;
-      for (let i = 0; i < idx.count; i += 1) mergedIndex.push(idx.getX(i) + indexOffset);
-      indexOffset += g.attributes.position.count;
-    }
-    merged.setIndex(mergedIndex);
-  }
-
-  // Groups.
-  if (useGroups) {
-    let base = 0;
-    geometries.forEach((g, gi) => {
-      const count = isIndexed ? g.index.count : g.attributes.position.count;
-      if (groupFn) {
-        // Keep the geometry's own groups, remapping their material index.
-        const groups = g.groups.length ? g.groups : [{ start: 0, count, materialIndex: 0 }];
-        for (let k = 0; k < groups.length; k += 1) {
-          merged.addGroup(groups[k].start + base, groups[k].count, groupFn(gi, k, groups[k]));
-        }
-      } else {
-        merged.addGroup(base, count, gi);
-      }
-      base += count;
-    });
-  }
-
-  return merged;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.setIndex(new THREE.BufferAttribute(index, 1));
+  geo.computeBoundingSphere();
+  return geo;
 }
 
-// BoxGeometry group order (px, nx, py, ny, pz, nz) mapped to a
-// [side, side, top, roof, side, side] material set.
-export const BOX_FACE_MAP = [0, 0, 1, 2, 0, 0];
+// Merge flat quads (window lights, road markings) into one geometry. Each quad
+// is { x, y, z, w, h, color, facing } where facing is 'x' (on a west/east wall,
+// quad spans z/y) or 'z' (on a north/south wall, spans x/y).
+export function mergeQuads(quads) {
+  const n = quads.length;
+  const positions = new Float32Array(n * 4 * 3);
+  const colors = new Float32Array(n * 4 * 3);
+  const index = new Uint32Array(n * 6);
+  const tmpColor = new THREE.Color();
+
+  for (let q = 0; q < n; q++) {
+    const item = quads[q];
+    tmpColor.setHex(item.color);
+    const v = q * 4;
+    const hw = item.w / 2;
+    const hh = item.h / 2;
+    let corners;
+    if (item.facing === 'x') {
+      corners = [
+        [item.x, item.y - hh, item.z - hw],
+        [item.x, item.y - hh, item.z + hw],
+        [item.x, item.y + hh, item.z + hw],
+        [item.x, item.y + hh, item.z - hw],
+      ];
+    } else {
+      corners = [
+        [item.x - hw, item.y - hh, item.z],
+        [item.x + hw, item.y - hh, item.z],
+        [item.x + hw, item.y + hh, item.z],
+        [item.x - hw, item.y + hh, item.z],
+      ];
+    }
+    for (let c = 0; c < 4; c++) {
+      const o = (v + c) * 3;
+      positions[o] = corners[c][0];
+      positions[o + 1] = corners[c][1];
+      positions[o + 2] = corners[c][2];
+      colors[o] = tmpColor.r;
+      colors[o + 1] = tmpColor.g;
+      colors[o + 2] = tmpColor.b;
+    }
+    const ib = q * 6;
+    index[ib] = v;
+    index[ib + 1] = v + 1;
+    index[ib + 2] = v + 2;
+    index[ib + 3] = v;
+    index[ib + 4] = v + 2;
+    index[ib + 5] = v + 3;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.setIndex(new THREE.BufferAttribute(index, 1));
+  geo.computeBoundingSphere();
+  return geo;
+}

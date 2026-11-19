@@ -3,30 +3,132 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Neon Harbor — an open-world crime game</title>
+<title>Neon Harbor</title>
 <link rel="icon" href="data:,">
 <style>
-  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #14121f; }
-  #game-canvas, #hud-canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
-  #hud-canvas { pointer-events: none; }
-  #bench-overlay {
-    display: none; position: fixed; left: 12px; bottom: 12px; z-index: 10;
-    font: 13px/1.5 monospace, sans-serif; color: #7dff9a; background: rgba(0,0,0,0.65);
-    padding: 6px 10px; border-radius: 6px; white-space: pre;
-  }
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0d1526; font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; color: #e8e8e8; }
+  #game { display: block; width: 100vw; height: 100vh; }
+  .overlay { position: fixed; inset: 0; display: none; }
+  .panel { position: absolute; background: rgba(8, 12, 22, 0.82); border: 1px solid #38e1c6; border-radius: 10px; padding: 18px 22px; }
+  /* Title screen */
+  #title-screen { display: block; background: linear-gradient(180deg, rgba(10,14,26,0.25) 0%, rgba(10,14,26,0.78) 78%); text-align: center; }
+  #title-screen .inner { position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%); width: min(640px, 92vw); }
+  #title-screen h1 { font-size: 58px; letter-spacing: 6px; margin: 0; color: #ff8a2a; text-shadow: 0 0 24px rgba(255, 138, 42, 0.55); }
+  #title-screen h2 { font-size: 17px; font-weight: 400; color: #bcd; margin: 10px 0 4px; }
+  #title-screen .story { font-size: 15px; line-height: 1.55; color: #ddd; margin: 14px auto; max-width: 560px; }
+  #title-screen .controls { font-size: 13.5px; line-height: 1.7; color: #aad; }
+  #title-screen .start { margin-top: 16px; font-size: 18px; color: #38e1c6; animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+  #quality-select { margin-top: 12px; background: #131c30; color: #e8e8e8; border: 1px solid #38e1c6; border-radius: 5px; padding: 5px 8px; font-size: 14px; }
+  /* HUD */
+  #hud { display: none; pointer-events: none; }
+  #top-left { position: absolute; top: 14px; left: 14px; background: rgba(8,12,22,0.66); border-radius: 8px; padding: 10px 14px; font-size: 15px; line-height: 1.5; }
+  #stars { font-size: 20px; letter-spacing: 3px; }
+  #money { font-size: 20px; font-weight: 700; color: #ffd23a; }
+  #health-bar { width: 150px; height: 9px; background: #333; border-radius: 5px; margin-top: 4px; overflow: hidden; }
+  #health-fill { height: 100%; width: 100%; background: #58c96b; }
+  #car-health { margin-top: 4px; font-size: 12px; color: #ccc; }
+  #car-bar { width: 150px; height: 7px; background: #333; border-radius: 4px; overflow: hidden; }
+  #car-fill { height: 100%; width: 100%; background: #4a9fd8; }
+  #mission-box { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); text-align: center; background: rgba(8,12,22,0.66); border-radius: 8px; padding: 8px 18px; max-width: 46vw; }
+  #mission-name { font-size: 15px; font-weight: 700; color: #38e1c6; }
+  #mission-text { font-size: 14px; margin-top: 2px; }
+  #radio { margin-top: 6px; font-size: 13px; color: #ffd9a0; font-style: italic; min-height: 16px; }
+  #compass { position: absolute; top: 150px; left: 50%; transform: translateX(-50%); border-radius: 4px; }
+  #speed-box { position: absolute; right: 16px; bottom: 14px; text-align: right; background: rgba(8,12,22,0.66); border-radius: 8px; padding: 8px 14px; }
+  #speed-num { font-size: 34px; font-weight: 700; color: #fff; line-height: 1; }
+  #speed-label { font-size: 12px; color: #aad; }
+  #minimap { position: absolute; top: 14px; right: 14px; border: 2px solid rgba(56, 225, 198, 0.6); border-radius: 6px; background: #0d1526; }
+  #toast { position: absolute; left: 50%; bottom: 110px; transform: translateX(-50%); background: rgba(8,12,22,0.85); border: 1px solid #ffd23a; border-radius: 8px; padding: 10px 20px; font-size: 17px; font-weight: 600; display: none; }
+  #mission-done { position: absolute; left: 50%; top: 34%; transform: translate(-50%, -50%); font-size: 34px; font-weight: 800; color: #38e1c6; text-shadow: 0 0 18px rgba(56,225,198,0.7); display: none; }
+  #bench { position: absolute; left: 14px; bottom: 14px; font-size: 12px; color: #8f8; background: rgba(0,0,0,0.6); padding: 4px 8px; border-radius: 4px; display: none; }
+  /* Pause / dead / complete */
+  #pause-screen, #dead-screen, #complete-screen { background: rgba(8, 12, 22, 0.72); text-align: center; }
+  #pause-screen .inner, #dead-screen .inner, #complete-screen .inner { position: absolute; left: 50%; top: 44%; transform: translate(-50%, -50%); }
+  #pause-screen h1, #dead-screen h1, #complete-screen h1 { font-size: 46px; margin: 0; letter-spacing: 4px; }
+  #dead-screen h1 { color: #ff4a3a; }
+  #complete-screen h1 { color: #38e1c6; }
+  .big { font-size: 18px; margin-top: 10px; }
+  .hint { font-size: 14px; color: #aad; margin-top: 16px; }
 </style>
+<script type="importmap">
+{ "imports": { "three": "./lib/three.module.min.js" } }
+</script>
 </head>
 <body>
-<canvas id="game-canvas"></canvas>
-<canvas id="hud-canvas"></canvas>
-<div id="bench-overlay"></div>
-<script type="importmap">
-{
-  "imports": {
-    "three": "./lib/three.module.min.js"
-  }
-}
-</script>
+<canvas id="game"></canvas>
+
+<div id="title-screen" class="overlay">
+  <div class="inner">
+    <h1>NEON HARBOR</h1>
+    <h2>An open-world crime story in a dusk-lit harbour city</h2>
+    <p class="story">Mara Voss is a fixer with nothing but a stolen set of wheels and a contact
+    named Del on the radio. Lift a car, run the jobs, and stay ahead of every cruiser
+    in the city — three missions stand between Mara and a clean getaway.</p>
+    <p class="controls">WASD / arrows — drive &amp; walk &nbsp;·&nbsp; E — steal car / get out<br>
+    Mouse — aim &amp; orbit camera &nbsp;·&nbsp; Click — shoot &nbsp;·&nbsp; F — punch<br>
+    P / Esc — pause &nbsp;·&nbsp; M — mute &nbsp;·&nbsp; Space — start / restart</p>
+    <p class="start">PRESS SPACE OR CLICK TO START</p>
+    <label>Quality
+      <select id="quality-select">
+        <option value="low">Low</option>
+        <option value="medium">Medium</option>
+        <option value="high" selected>High</option>
+      </select>
+    </label>
+    <p class="hint">Original work — no real city, no real cars, no brands.</p>
+  </div>
+</div>
+
+<div id="hud" class="overlay">
+  <div id="top-left">
+    <div id="money">$0</div>
+    <div id="best-money" style="font-size:12px;color:#aad">Best $0</div>
+    <div id="stars">☆☆☆☆☆</div>
+    <div>HP <span id="health-num">100</span></div>
+    <div id="health-bar"><div id="health-fill"></div></div>
+    <div id="car-health">Car HP <span id="car-num">100</span>
+      <div id="car-bar"><div id="car-fill"></div></div>
+    </div>
+  </div>
+  <div id="mission-box">
+    <div id="mission-name">First Wheels</div>
+    <div id="mission-text">Steal a car — walk up to one and press E</div>
+    <div id="radio"></div>
+  </div>
+  <canvas id="compass" width="220" height="26"></canvas>
+  <canvas id="minimap" width="190" height="190"></canvas>
+  <div id="speed-box"><span id="speed-num">0</span><div id="speed-label">km/h</div></div>
+  <div id="toast"></div>
+  <div id="mission-done">MISSION COMPLETE</div>
+  <div id="bench"></div>
+</div>
+
+<div id="pause-screen" class="overlay">
+  <div class="inner">
+    <h1>PAUSED</h1>
+    <p class="hint">Press P or Esc to keep playing</p>
+  </div>
+</div>
+
+<div id="dead-screen" class="overlay">
+  <div class="inner">
+    <h1>FLATLINED</h1>
+    <p class="big">Mara went down in Neon Harbor.</p>
+    <p class="big">Money kept: <span id="dead-money">$0</span></p>
+    <p class="hint">Press Space to try again</p>
+  </div>
+</div>
+
+<div id="complete-screen" class="overlay">
+  <div class="inner">
+    <h1>ALL JOBS DONE</h1>
+    <p class="big">Three missions, one clean getaway.</p>
+    <p class="big">Total money: <span id="complete-money">$0</span></p>
+    <p class="hint">Press Space to play again</p>
+  </div>
+</div>
+
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>
